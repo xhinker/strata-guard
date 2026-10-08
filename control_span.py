@@ -53,8 +53,54 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def inside_span(tail: str) -> bool:
-    """True when the tail looks like the model is inside a quote/code span."""
+def _open_code_span(text: str) -> bool:
+    """True when a code block or inline code span is still open at the end of `text`.
+
+    Rule 2 below only catches a span that is open AT THE END of the reply (the tail ends on an
+    opening backtick).  A model writing markdown usually stops somewhere else: inside a fenced
+    block, or with an inline span opened earlier and never closed.  Both are truncations, and
+    neither was covered - measured 2026-10-08, where an unclosed ``` block came back identical
+    from a guarded and an unguarded server.
+
+    A single backtick OPENS a span only where the ported predicate says it opens one: at the
+    start of the text or after one of _OPENERS.  Anywhere else ("done`") it reads as a closing
+    backtick, so it must not open anything - that case is a test on purpose.
+    """
+    i, n = 0, len(text)
+    fence = None          # the fence character while inside a ``` / ~~~ block
+    inline = False
+    while i < n:
+        c = text[i]
+        if c not in ("`", "~"):
+            i += 1
+            continue
+        j = i
+        while j < n and text[j] == c:
+            j += 1
+        prev = text[i - 1] if i else " "
+        if j - i >= 3:                                  # a fence: opens or closes a block
+            if fence is None:
+                fence = c
+            elif c == fence:
+                fence = None
+        elif fence is None:                             # inline backticks, ignored inside a block
+            if inline:
+                inline = False                          # closing
+            elif prev in _OPENERS:
+                inline = True                           # opening (start of text counts as a space)
+        i = j
+    return fence is not None or inline
+
+
+def inside_span(text: str, window: int = 32, scan: int | None = None) -> bool:
+    """True when the model looks cut off inside a quote, a code span or a code block.
+
+    `text` is the recent generated text (up to `scan` characters).  Rules 1-3 stay deliberately
+    local - they look at the last `window` characters only, because global quote parity was
+    "too sticky": one lone quote far back kept the guard blocking forever.  Rule 4 cannot be
+    local: a fenced block is longer than any tail, so it reads the whole `scan` window.
+    """
+    tail = text[-window:]
     # (1) odd number of double quotes INSIDE the window only (global parity was
     #     "too sticky": one lone quote far back kept the guard blocking forever)
     if tail.count('"') % 2 == 1:
@@ -81,6 +127,12 @@ def inside_span(tail: str) -> bool:
         if ">" not in rest and not any(c in _WHITESPACE for c in rest):
             return True
 
+    # (4) an OPEN code block or code span anywhere in the scan window - the case a tail-local
+    #     rule cannot see: the model stopped inside a fenced block, or after an inline span it
+    #     opened earlier and never closed.
+    if _open_code_span(text if scan is None else text[-scan:]):
+        return True
+
     return False
 
 
@@ -94,8 +146,10 @@ def escape_text(raw: str) -> str:
 class Guard:
     CONTROL_TYPE = 3          # token_type.json: 3 = CONTROL (<|im_start|>, <|im_end|>, <|endoftext|>)
 
-    def __init__(self, tok, eos_ids, types=None, window=32, max_rescues=2, log=sys.stderr):
+    def __init__(self, tok, eos_ids, types=None, window=32, max_rescues=2, log=sys.stderr,
+                 scan=2000):
         self.tok, self.eos_ids, self.types = tok, set(eos_ids), types
+        self.scan = max(window, scan)
         # the token to spell out when the stream itself carried no eos (the resident engine returns on
         # DONE without yielding it): the configured turn-end id, i.e. the last one listed.
         ordered = [int(x) for x in eos_ids]
@@ -173,11 +227,12 @@ class Guard:
             if not produced and stop_id is None:
                 return
 
-            tail = self.tail_text(produced)[-self.window:]
+            recent = self.tail_text(produced)[-self.scan:]
+            tail = recent[-self.window:]
             # (b): the stream ended by itself, so a stop short of the cap is an end-of-turn.
             ended_by_stream = stop_id is None and len(produced) + 1 < max_new
             stopping = stop_id is not None or ended_by_stream
-            if not (stopping and inside_span(tail)):
+            if not (stopping and inside_span(recent, window=self.window, scan=self.scan)):
                 if stop_id is not None:
                     yield stop_id            # a genuine end of turn: let it end as "stop"
                 return
@@ -213,7 +268,8 @@ def install(server_module, tok, types=None, eos_ids=None, force=False):
                             ",".join(str(e) for e in DEFAULT_EOS)).split(",") if x.strip())
     guard = Guard(tok, eos, types=types,
                   window=_env_int("STRATA_CONTROL_SPAN_WINDOW", 32),
-                  max_rescues=_env_int("STRATA_CONTROL_SPAN_RESCUES", 2))
+                  max_rescues=_env_int("STRATA_CONTROL_SPAN_RESCUES", 2),
+                  scan=_env_int("STRATA_CONTROL_SPAN_SCAN", 2000))
     cls = server_module.StrataEngine
     original = cls.generate
 

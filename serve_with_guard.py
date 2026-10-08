@@ -12,6 +12,7 @@ No upstream file is modified; the patch exists only for this process.
     --control-span-guard on|off     enable/disable (default: off, or the env var)
     --control-span-window N         characters inspected at the end of the text (32)
     --control-span-rescues N        at most N rescues per request (2)
+    --control-span-scan N           characters scanned for an open code span/block (2000)
 """
 
 from __future__ import annotations
@@ -97,12 +98,15 @@ def main() -> int:
     argv, guard_flag = _take_flag(argv, "--control-span-guard", str, None)
     argv, window = _take_flag(argv, "--control-span-window", int, None)
     argv, rescues = _take_flag(argv, "--control-span-rescues", int, None)
+    argv, scan = _take_flag(argv, "--control-span-scan", int, None)
     if guard_flag is not None:
         os.environ["STRATA_CONTROL_SPAN_GUARD"] = guard_flag
     if window is not None:
         os.environ["STRATA_CONTROL_SPAN_WINDOW"] = str(window)
     if rescues is not None:
         os.environ["STRATA_CONTROL_SPAN_RESCUES"] = str(rescues)
+    if scan is not None:
+        os.environ["STRATA_CONTROL_SPAN_SCAN"] = str(scan)
 
     # the pack path: from --pack on the command line, else the model config's args
     pack = None

@@ -144,5 +144,14 @@ check("heartbeats are forwarded, never recorded as ids; the rescue still happene
       hok and None in hseen and "\u200b" in tok.decode([t for t in hseen if t is not None])
       and hended and heng.calls >= 2)
 
-print(f"\n  8 checks, {fail} failures")
+print("\nunclosed fenced block (markdown) - the case a tail-local rule cannot see:")
+fseen, fended, feng = run("Here is an example:" + chr(96)*3 + "python\nprint(1)")
+fout = tok.decode([x for x in fseen if x is not None])
+check(f"the open code block was rescued ({len(fseen)} ids, {feng.calls} engine calls)",
+      "\u200b" in fout and feng.calls >= 2 and fended)
+cseen2, cended2, ceng2 = run("Here is an example:" + chr(96)*3 + "python\nprint(1)\n" + chr(96)*3)
+check("a CLOSED code block is a legitimate ending and is not rescued",
+      "\u200b" not in tok.decode([x for x in cseen2 if x is not None]) and ceng2.calls == 1)
+
+print(f"\n  10 checks, {fail} failures")
 raise SystemExit(1 if fail else 0)
