@@ -32,8 +32,20 @@ PARITY = [
     (F3 + 'sh\nls\n' + F3 + ' then run `deploy', True, "closed block, then an open inline span"),
     ('the model wrote `x` and stopped', False, "closed inline span, prose after it"),
     ('a fence marker inside a block:\n' + F3 + 'a\n' + F3 + ' is fine', False, "two closed blocks"),
-    # documented limit: a block opened before the scan window is not visible to it
-    (F3 + 'python\n' + 'y' * 3000, False, "block opened beyond the scan window (known limit)"),
+    (F3 + 'python\n' + 'y' * 3000, True, "a long block is still open over the whole turn"),
+]
+
+# --- why rule 4 is not windowed (the artifact a window creates) ---
+# the block must be LONGER than the cap, or the window never starts inside it
+BODY = "".join("    value_%d = %d\n" % (i, i) for i in range(20))          # ~460 chars
+ANSWER = ("Use the `CORSMiddleware` from `fastapi.middleware.cors`.\n\n" + F3 + "python\n" + BODY
+          + F3 + "\n\n**Key points:**\n- `allow_origins`: use " + F3 + '["*"]' + F3 + " for all.\n")
+CLOSED = ANSWER[:ANSWER.index(F3 + "\n\n**Key points") + 4]     # ends exactly at the closing fence
+WINDOWED = [
+    (CLOSED, 0, False, "a closed answer, read over the whole turn: no false positive"),
+    (CLOSED, 200, True, "the same text capped at 200 chars: the window starts inside the block, "
+                        "so its closing fence reads as an opening one"),
+    (CLOSED + "\n\n" + F3 + "bash\nls", 0, True, "a block genuinely left open at the end"),
 ]
 
 def run():
@@ -43,14 +55,19 @@ def run():
         ok = got == want
         bad += 0 if ok else 1
         print(f"  {'PASS' if ok else 'FAIL'}  want={want!s:5s} got={got!s:5s}  {label}")
+    for text, scan, want, label in WINDOWED:
+        got = inside_span(text, scan=scan)
+        ok = got == want
+        bad += 0 if ok else 1
+        print(f"  {'PASS' if ok else 'FAIL'}  want={want!s:5s} got={got!s:5s}  {label}")
     for text, want, label in PARITY:
-        got = inside_span(text, scan=2000)
+        got = inside_span(text, scan=0)
         ok = got == want
         bad += 0 if ok else 1
         print(f"  {'PASS' if ok else 'FAIL'}  want={want!s:5s} got={got!s:5s}  {label}")
     assert escape_text("</think>") == "<" + ZWSP + "/think>", escape_text("</think>")
     print(f"  PASS  escape_text inserts U+200B after the first character")
-    print(f"\n  {len(CASES)+len(PARITY)+1} cases, {bad} failures")
+    print(f"\n  {len(CASES)+len(PARITY)+len(WINDOWED)+1} cases, {bad} failures")
     return 1 if bad else 0
 
 if __name__ == "__main__":

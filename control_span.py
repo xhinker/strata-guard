@@ -127,10 +127,15 @@ def inside_span(text: str, window: int = 32, scan: int | None = None) -> bool:
         if ">" not in rest and not any(c in _WHITESPACE for c in rest):
             return True
 
-    # (4) an OPEN code block or code span anywhere in the scan window - the case a tail-local
-    #     rule cannot see: the model stopped inside a fenced block, or after an inline span it
-    #     opened earlier and never closed.
-    if _open_code_span(text if scan is None else text[-scan:]):
+    # (4) an OPEN code block or code span - the case a tail-local rule cannot see: the model
+    #     stopped inside a fenced block, or after an inline span it opened earlier and left open.
+    #
+    # This one cannot be windowed.  A window that starts INSIDE a code block sees that block's
+    # closing fence as an opening one, and reports a perfectly closed answer as an open span
+    # (measured: the last 200 characters of a complete FastAPI answer return True).  Parity is
+    # only meaningful over the whole turn, so `scan` defaults to 0 = no limit; a positive value
+    # caps the work for very long outputs and accepts that artifact.
+    if _open_code_span(text if not scan else text[-scan:]):
         return True
 
     return False
@@ -147,9 +152,9 @@ class Guard:
     CONTROL_TYPE = 3          # token_type.json: 3 = CONTROL (<|im_start|>, <|im_end|>, <|endoftext|>)
 
     def __init__(self, tok, eos_ids, types=None, window=32, max_rescues=2, log=sys.stderr,
-                 scan=2000):
+                 scan=0):
         self.tok, self.eos_ids, self.types = tok, set(eos_ids), types
-        self.scan = max(window, scan)
+        self.scan = max(0, scan)          # 0 = the whole turn (see inside_span rule 4)
         # the token to spell out when the stream itself carried no eos (the resident engine returns on
         # DONE without yielding it): the configured turn-end id, i.e. the last one listed.
         ordered = [int(x) for x in eos_ids]
@@ -269,7 +274,7 @@ def install(server_module, tok, types=None, eos_ids=None, force=False):
     guard = Guard(tok, eos, types=types,
                   window=_env_int("STRATA_CONTROL_SPAN_WINDOW", 32),
                   max_rescues=_env_int("STRATA_CONTROL_SPAN_RESCUES", 2),
-                  scan=_env_int("STRATA_CONTROL_SPAN_SCAN", 2000))
+                  scan=_env_int("STRATA_CONTROL_SPAN_SCAN", 0))
     cls = server_module.StrataEngine
     original = cls.generate
 
