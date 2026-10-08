@@ -4,12 +4,13 @@ The guard acts on exactly one condition: the generation ENDS (its last token is 
 the eos ids) while the tail looks like an open quote / code span / half-typed tag.
 So every "positive" probe below has to end mid-span, and the negative controls must not.
 
-    python3 probe_guard.py [PORT] [API_KEY]
+    python3 probe_guard.py [PORT] [API_KEY]   # defaults: 8080, $STRATA_API_KEY
 """
 import json, sys, urllib.request
 
-PORT = sys.argv[1] if len(sys.argv) > 1 else "8084"
-KEY  = sys.argv[2] if len(sys.argv) > 2 else ""
+import os
+PORT = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("STRATA_PORT", "8080")
+KEY  = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("STRATA_API_KEY", "")
 BASE = f"http://127.0.0.1:{PORT}"
 
 LT, BT, QT, PIPE = "<", "`", '"', "|"          # built, never written as a tag literal

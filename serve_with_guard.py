@@ -4,7 +4,7 @@
 Usage (same arguments as serve/server.py, plus the guard's own):
 
     python3 Strata-guard/serve_with_guard.py --engine strata \
-        --config strata-3090x3-iq3s.json --port 8081 --control-span-guard on
+        --config <your-model-config>.json --port 8080 --control-span-guard on
 
 The guard is OFF unless STRATA_CONTROL_SPAN_GUARD=on or --control-span-guard on.
 No upstream file is modified; the patch exists only for this process.
@@ -21,7 +21,8 @@ import os
 import sys
 from pathlib import Path
 
-STRATA = os.environ.get("STRATA_ROOT", "/mnt/data_2t/github_repos/Strata")
+# Strata's checkout: $STRATA_ROOT if set, else the sibling directory named "Strata".
+STRATA = os.environ.get("STRATA_ROOT") or str(Path(__file__).resolve().parent.parent / "Strata")
 sys.path.insert(0, STRATA)
 sys.path.insert(0, str(Path(STRATA) / "tools"))   # strata_tokenizer lives here (tools/strata_tokenizer.py)
 sys.path.insert(0, str(Path(__file__).resolve().parent))

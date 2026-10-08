@@ -57,7 +57,8 @@ would never fire.  The first integration test failed for exactly this reason.
 | `--control-span-rescues N` | `STRATA_CONTROL_SPAN_RESCUES` | 2 |
 | — | `STRATA_CONTROL_SPAN_EOS` | `248044,248046` |
 
-Run-script form: `CONTROL_SPAN_GUARD=on ./run-3090x3-iq3s.sh <CTX> <EC> <GPUS> <PORT> <VISION>`
+Start it through your own launch script by exporting `CONTROL_SPAN_GUARD=on` (or pass the flag to
+`serve_with_guard.py` directly).
 
 The turn-end token escaped on a rescue: the last id in the configured eos list (248046,
 `<|im_end|>`), because the resident engine never yields the eos itself.

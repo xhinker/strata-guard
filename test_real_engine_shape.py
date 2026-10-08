@@ -3,16 +3,31 @@ WITHOUT yielding the eos token.  The first version of the guard tested only
 `produced[-1] in eos_ids`, so it never fired in production while the MockEngine (which does
 yield the end-of-turn token) made it look healthy.  This test pins the production shape.
 """
-import json, sys, threading
+import json, sys, threading, os
 from pathlib import Path
-STRATA = Path("/mnt/data_2t/github_repos/Strata")
+STRATA = Path(os.environ.get("STRATA_ROOT") or Path(__file__).resolve().parent.parent / "Strata")
 sys.path.insert(0, str(STRATA)); sys.path.insert(0, str(STRATA / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import control_span as CS                                  # noqa: E402
 import strata_tokenizer as ST                              # noqa: E402
 
-PACK = Path(json.loads((STRATA / "strata-3090x3-iq3s.json").read_text())["args"][
-    json.loads((STRATA / "strata-3090x3-iq3s.json").read_text())["args"].index("--pack") + 1]) / "tokenizer"
+def _pack_dir():
+    """The tokenizer pack named by a Strata config: $STRATA_CONFIG, else the first strata-*.json."""
+    import glob
+    named = os.environ.get("STRATA_CONFIG")
+    cand = Path(named) if named else None
+    if cand is None or not cand.is_absolute():
+        cand = (STRATA / cand) if named else None
+    if cand is None or not cand.exists():
+        hits = sorted(glob.glob(str(STRATA / "strata-*.json")))
+        if not hits:
+            raise SystemExit("no strata-*.json found in %s - set STRATA_ROOT / STRATA_CONFIG" % STRATA)
+        cand = Path(hits[0])
+    args = json.loads(cand.read_text())["args"]
+    return Path(args[args.index("--pack") + 1]) / "tokenizer"
+
+
+PACK = _pack_dir()
 vocab = json.loads((PACK / "vocab.json").read_text(encoding="utf-8"))
 tokens = [None] * len(vocab)
 for t, i in vocab.items(): tokens[i] = t

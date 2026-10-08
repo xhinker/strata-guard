@@ -4,16 +4,28 @@ No GPU: MockEngine replays a scripted completion as token ids and then emits the
 end-of-turn token.  With a script that ends INSIDE an open span, the stop is the
 pathological case, so the guard must rescue it.
 """
-import json, os, sys
+import json, os, sys, os
 from pathlib import Path
 
-STRATA = Path("/mnt/data_2t/github_repos/Strata")
+STRATA = Path(os.environ.get("STRATA_ROOT") or Path(__file__).resolve().parent.parent / "Strata")
 sys.path.insert(0, str(STRATA)); sys.path.insert(0, str(Path(__file__).resolve().parent))
+def _config_path():
+    """A Strata model config: $STRATA_CONFIG, else the first strata-*.json in the checkout."""
+    import glob
+    named = os.environ.get("STRATA_CONFIG")
+    if named:
+        return Path(named) if Path(named).is_absolute() else STRATA / named
+    hits = sorted(glob.glob(str(STRATA / "strata-*.json")))
+    if not hits:
+        raise SystemExit("no strata-*.json found in %s - set STRATA_ROOT / STRATA_CONFIG" % STRATA)
+    return Path(hits[0])
+
+
 import control_span as CS                                    # noqa: E402
 from serve import server as S                                # noqa: E402
 import strata_tokenizer as ST                                # noqa: E402
 
-CFG = json.loads((STRATA / "strata-3090x3-iq3s.json").read_text())
+CFG = json.loads(_config_path().read_text())
 ARGS = CFG["args"]; PACK = Path(ARGS[ARGS.index("--pack") + 1]) / "tokenizer"
 vocab = json.loads((PACK / "vocab.json").read_text(encoding="utf-8"))
 tokens = [None] * len(vocab)
