@@ -106,7 +106,7 @@ class Guard:
         """Decode the recent ids the way llama.cpp builds its tail: CONTROL tokens render as
         the empty piece (common_token_to_piece(..., special=false)).  Rendering them as text
         would let the stop token itself close the span the predicate looks for."""
-        recent = ids[-keep:]
+        recent = [t for t in ids[-keep:] if isinstance(t, int)]   # None heartbeats are not ids
         if self.types is not None:
             recent = [t for t in recent
                       if t >= len(self.types) or self.types[t] != self.CONTROL_TYPE]
@@ -127,42 +127,82 @@ class Guard:
         return [t for t in out if t != token_id]
 
     def guard(self, engine, ids, max_new, sampling, cancel, embeddings=None):
-        """Wrap one generation: same ids out, plus a rescue when the stop is inside a span."""
+        """Wrap one generation: same ids out, plus a rescue when the stop is inside a span.
+
+        A turn can end two ways and the check belongs in different places for each.
+
+        (a) THE ENGINE YIELDS THE TURN-END ID.  This is what the current engine does, and it
+            is the shape that made the guard dead: the consumer (serve/server.py:3297,
+            `if t in self.stop_ids:  finish = "stop"; raw_ids.append(t); break`) stops pulling
+            the moment it sees that id, which closes this generator at its `yield` - so any
+            check written after the loop never runs.  The decision therefore has to be made
+            BEFORE the id is handed over: withhold it, rescue if the tail says the model was
+            quoting something, and only hand it over once the turn really is over (so the
+            caller still gets finish_reason "stop").
+        (b) THE ENGINE RETURNS WITHOUT YIELDING A TURN-END ID (older builds: it streams `T <id>`
+            lines then a bare `DONE`).  Here the end of the stream IS the end of the turn, so
+            the check belongs after the loop, and "ended short of the cap" is the signal.
+        """
         produced: list[int] = []
         rescues = 0
         while True:
-            for t in engine(ids + produced, max(1, max_new - len(produced)), sampling, cancel, embeddings):
+            budget = max(1, max_new - len(produced))
+            gen = engine(ids + produced, budget, sampling, cancel, embeddings)
+            stop_id = None
+            for t in gen:
+                if t is None:
+                    # The engine emits None as a heartbeat while it is quiet (serve/server.py
+                    # does the same: pass it on, never treat it as a generated token).
+                    yield t
+                    continue
+                if t in self.eos_ids:
+                    stop_id = t
+                    break                    # withhold it: yielding it would end the consumer
                 produced.append(t)
                 yield t
-            if cancel.is_set() or not produced:
+            if stop_id is not None:
+                try:
+                    gen.close()              # the same abandonment the server's stop path does
+                except Exception:
+                    pass
+
+            if cancel.is_set():
+                if stop_id is not None:
+                    yield stop_id
                 return
+            if not produced and stop_id is None:
+                return
+
             tail = self.tail_text(produced)[-self.window:]
-            # How the turn ended matters.  The resident engine streams `T <id>` lines and a bare
-            # `DONE`; it does NOT yield the eos token (server.py: ~1370), so an eos test alone never
-            # fires in production.  The reliable signal is: the stream ended SHORT of the cap and the
-            # request was not cancelled -> the engine stopped on an end-of-turn token.  The eos test is
-            # kept as a bonus for callers that do yield it (the MockEngine, for one).
-            ended_early = len(produced) + 1 < max_new and not cancel.is_set()
-            ended_on_eos = bool(produced) and produced[-1] in self.eos_ids
-            if not ((ended_early or ended_on_eos) and inside_span(tail)):
+            # (b): the stream ended by itself, so a stop short of the cap is an end-of-turn.
+            ended_by_stream = stop_id is None and len(produced) + 1 < max_new
+            stopping = stop_id is not None or ended_by_stream
+            if not (stopping and inside_span(tail)):
+                if stop_id is not None:
+                    yield stop_id            # a genuine end of turn: let it end as "stop"
                 return
             if rescues >= self.max_rescues:
                 self._note("stop inside a span, but the rescue cap (%d) is reached - letting it end",
                            self.max_rescues)
+                if stop_id is not None:
+                    yield stop_id
                 return
-            target = produced[-1] if ended_on_eos else self.turn_id
+
+            target = stop_id if stop_id is not None else self.turn_id
             esc = self.escape_ids(target)
             if not esc:
+                if stop_id is not None:
+                    yield stop_id
                 return
             rescues += 1
             self._note("rescue %d: the turn ended inside a span (%s, tail=%r) - continuing with the "
                        "escaped spelling of token %d as %s", rescues,
-                       "eos token" if ended_on_eos else "short of the cap, so a turn-end token",
+                       "the engine yielded the turn-end id" if stop_id is not None
+                       else "the stream ended short of the cap, so a turn-end token",
                        tail[-24:], target, esc)
-            for t in esc:                                    # the caller sees the escaped text
+            for t in esc:                    # the caller sees the escaped text
                 produced.append(t)
                 yield t
-
 
 def install(server_module, tok, types=None, eos_ids=None, force=False):
     """Monkey-patch StrataEngine.generate. Returns the guard object (or None if off)."""

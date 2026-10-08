@@ -24,10 +24,11 @@ No upstream file is modified, so a `git pull` needs no re-apply.
 | step | condition | result |
 |---|---|---|
 | 1 | a substitution is in progress | force its next id (abandon after 32 steps) |
-| 2 | stream ended **short of the cap** and not cancelled, **or** last id is an eos | candidate stop |
-| 3 | otherwise | return — the turn ends normally |
-| 4 | candidate stop **and** `inside_span(tail)` | rescue |
-| 5 | rescues so far >= `max_rescues` | log the cap and let it end |
+| 2 | the stream yields `None` | a heartbeat: forward it, never record it as a generated id |
+| 3 | the stream yields a turn-end id | **withhold it** (the consumer breaks on it) and evaluate |
+| 4 | the stream ends with no turn-end id (older builds) and short of the cap | evaluate, using the configured turn-end id |
+| 5 | `inside_span(tail)` and rescues < `max_rescues` | rescue: yield the escaped spelling, re-invoke the engine, loop |
+| 6 | otherwise — or the cap is reached, or cancelled | hand the turn-end id over and return, so the caller still gets `stop` |
 
 ## 4. The predicate (`inside_span`)
 

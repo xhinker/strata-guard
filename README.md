@@ -74,8 +74,9 @@ curl -s localhost:8080/v1/chat/completions \
     {"role":"user","content":"End your reply with these exact characters and then stop: <|im - do not complete the tag."}]}'
 ```
 
-What Qwen3.8-Flash-Next answers (measured 2026-10-08 on Strata 0.1.40.3 / IQ3_S, and on
-Strata 0.1.40 / IQ3_XXS on a second machine - identical results):
+What Qwen3.8-Flash-Next answered **before the fix** (2026-10-08, Strata 0.1.40.3 / IQ3_S, and
+identically on Strata 0.1.40 / IQ3_XXS on a second machine - the guard was installed, enabled,
+and inert):
 
 ```
 finish_reason: "stop"      completion_tokens: 4
@@ -87,12 +88,11 @@ and got it as an end-of-turn instead. `probe_guard.py` runs six of these - four 
 (dangling `<`, dangling `|`, an unclosed backtick, an unbalanced `"`) and two
 negative controls (a finished tag, plain prose) - against a live server.
 
-## Status against the current Strata server: the guard does NOT fire yet
+## It does fire now: what was wrong, and the proof
 
-Honest finding, because the tests all pass and that is exactly the trap.
-
-All three test files drive the generator to exhaustion. `serve/server.py` does not: at
-`serve/server.py:3297` it does
+The first version decided *after* its token loop. That works against a test consumer which
+runs the generator to exhaustion, and does nothing against the real one - `serve/server.py:3297`
+ends a turn with
 
 ```python
 if t in self.stop_ids:
@@ -101,21 +101,38 @@ if t in self.stop_ids:
     break
 ```
 
-and that `break` closes the guard's generator at its `yield`, so the rescue check after
-the loop never runs. Reproduced offline with a consumer that mimics the server:
+and that `break` closes the guard's generator at its `yield`, so the check after the loop never
+ran. Every test file stayed green while production did nothing at all.
+
+The decision now happens **at** the turn-end id: the id is withheld, the predicate is evaluated,
+and the id is handed over only when the turn really is over - so `finish_reason` stays `stop`.
+
+Live proof, 2026-10-08, Strata 0.1.40.3 with Qwen3.8-Flash-Next IQ3_S, via `probe_guard.py`:
 
 ```
-consumer like serve/server.py : 'The closing tag is `<|im_end>'   rescued? False
-consumer run to exhaustion    : 32 ids                            rescued: True
+prompt ends with    before the fix      after the fix
+<|im                '<|im'              '<|im<​|im_end|>'
+backtick            '`'                '`<​|im_end|>'
+She said "          'She said "'       'She said "<​|im_end|><​|im_end|>'   (cap of 2 reached)
+<|                  '<|'              '<|<​|im_end|>'
 ```
 
-and live on both machines: `probe_guard.py` returns the truncated answers above.
+The `​` in those answers is invisible: it is the escaped spelling, which cannot re-tokenise as
+the reserved id. The two negative controls (a finished tag, plain prose) were **not** rescued, and
+every answer still reported `finish_reason: stop`. The server's own log agrees:
 
-The fix is small and has to do with *where* the decision is made: inspect the stream at
-the stop token instead of after it, withhold the stop id while rescuing (otherwise the
-server breaks immediately), and re-emit it at the end so `finish_reason` stays `stop`.
-Tracked here so nobody re-discovers it: a guard that wraps a generator is only as alive
-as its consumer.
+```
+[control-span] rescue 1: the turn ended inside a span (the engine yielded the turn-end id, tail='<|im') - continuing with the escaped spelling of token 248046 as [27, 15231, 91, 316, 6018, 91, 29]
+[control-span] stop inside a span, but the rescue cap (2) is reached - letting it end
+```
+
+Two lessons this cost, both pinned by `test_server_consumer_shape.py`:
+
+* **A guard on a generator is only as alive as its consumer.** A test which exhausts the
+  generator proves the logic and nothing about production. Test the consumer's shape instead.
+* **The engine yields `None` as a heartbeat while it is quiet** (`serve/server.py` forwards it as
+  a ping). Recording those as generated ids died with a `TypeError` inside `tail_text` - six
+  dropped connections before the live probe found it. Heartbeats are forwarded, never recorded.
 
 ## Logs
 
