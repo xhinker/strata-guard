@@ -167,7 +167,7 @@ modified, and if you remove the flag you are back to stock behaviour.
 You should see this line at startup:
 
 ```
-[control-span] ENABLED (eos ids [248044, 248046], window 32, max rescues 2)
+[control-span] ENABLED (eos ids [248044, 248046], think ids [248068, 248069], window 32, max rescues 5)
 ```
 
 ### Options
@@ -176,9 +176,10 @@ You should see this line at startup:
 |---|---|---|---|
 | `--control-span-guard on\|off` | `STRATA_CONTROL_SPAN_GUARD` | `off` | enable the guard |
 | `--control-span-window N` | `STRATA_CONTROL_SPAN_WINDOW` | `32` | characters inspected at the end of the reply (rules 1-3) |
-| `--control-span-rescues N` | `STRATA_CONTROL_SPAN_RESCUES` | `2` | maximum rescues per request |
+| `--control-span-rescues N` | `STRATA_CONTROL_SPAN_RESCUES` | `5` | maximum rescues per request |
 | `--control-span-scan N` | `STRATA_CONTROL_SPAN_SCAN` | `0` | characters scanned for an open code span/block; `0` = the whole turn |
 | `--control-span-eos IDS` | `STRATA_CONTROL_SPAN_EOS` | `248044,248046` | turn-end token ids (Qwen3 / Qwen3.5 / Qwen3.8) |
+| `--control-span-think IDS` | `STRATA_CONTROL_SPAN_THINK` | `248068,248069` | think open/close token ids (Qwen3 / Qwen3.5 / Qwen3.8) |
 
 ## How it works
 
@@ -188,8 +189,8 @@ produces a **turn-end id** it does not pass it on immediately - it holds it back
 ```
 1. forward everything the engine yields, including the None heartbeats it emits while idle
 2. on a turn-end id: hold it back, decode the recent text, evaluate the predicate
-3. inside a span  -> yield the ESCAPED spelling of the turn-end token, re-invoke the engine,
-                     and go back to step 1  (up to --control-span-rescues times)
+3. inside a span or an open thinking block -> yield the ESCAPED spelling of the turn-end token,
+                     re-invoke the engine, and go back to step 1  (up to --control-span-rescues times)
 4. not inside one -> hand the held turn-end id over, so the caller still sees a normal stop
 ```
 
@@ -199,7 +200,11 @@ The predicate says "inside a span" when the text ends with:
 2. a `|`, or an opening backtick, or
 3. a `<` with no `>` and no whitespace after it, or
 4. **an open code block or code span anywhere in the turn** - a fenced block the model never
-   closed, or an inline span it opened earlier and left open.
+   closed, or an inline span it opened earlier and left open, or
+5. **the thinking block is still open** - the most recent think tag in the generated ids is
+   the open tag (248068). A stop there is a truncation, never an end of turn. Id-based, not
+   text-based: a model quoting the tag spells it as character pieces and never emits the
+   reserved id, so this cannot fire on quoted text.
 
 Rules 1-3 are deliberately local: global quote parity was tried, and one lone quote several
 hundred characters back kept the guard intervening forever. Rule 4 cannot be local, because a

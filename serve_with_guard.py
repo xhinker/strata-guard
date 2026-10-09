@@ -11,9 +11,10 @@ No upstream file is modified; the patch exists only for this process.
 
     --control-span-guard on|off     enable/disable (default: off, or the env var)
     --control-span-window N         characters inspected at the end of the text (32)
-    --control-span-rescues N        at most N rescues per request (2)
+    --control-span-rescues N        at most N rescues per request (5)
     --control-span-scan N           characters scanned for an open code span/block (0 = the whole turn)
     --control-span-eos IDS          turn-end token ids, comma separated (Qwen: 248044,248046)
+    --control-span-think IDS        think open/close token ids (Qwen: 248068,248069)
 """
 
 from __future__ import annotations
@@ -101,6 +102,7 @@ def main() -> int:
     argv, rescues = _take_flag(argv, "--control-span-rescues", int, None)
     argv, scan = _take_flag(argv, "--control-span-scan", int, None)
     argv, eos = _take_flag(argv, "--control-span-eos", str, None)
+    argv, think = _take_flag(argv, "--control-span-think", str, None)
     if guard_flag is not None:
         os.environ["STRATA_CONTROL_SPAN_GUARD"] = guard_flag
     if window is not None:
@@ -111,6 +113,8 @@ def main() -> int:
         os.environ["STRATA_CONTROL_SPAN_SCAN"] = str(scan)
     if eos is not None:                      # comma-separated turn-end ids, e.g. "248044,248046"
         os.environ["STRATA_CONTROL_SPAN_EOS"] = eos
+    if think is not None:                    # comma-separated think open/close ids, e.g. "248068,248069"
+        os.environ["STRATA_CONTROL_SPAN_THINK"] = think
 
     # the pack path: from --pack on the command line, else the model config's args
     pack = None

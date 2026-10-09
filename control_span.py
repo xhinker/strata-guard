@@ -32,6 +32,7 @@ import sys
 import types
 
 DEFAULT_EOS = (248044, 248046)          # <|endoftext|>, <|im_end|>   (engine default)
+DEFAULT_THINK = (248068, 248069)        # think open/close (token_type.json: 4 = USER_DEFINED)
 ZWSP = "\u200b"
 
 _WHITESPACE = " \t\r\n\f\v"
@@ -151,8 +152,8 @@ def escape_text(raw: str) -> str:
 class Guard:
     CONTROL_TYPE = 3          # token_type.json: 3 = CONTROL (<|im_start|>, <|im_end|>, <|endoftext|>)
 
-    def __init__(self, tok, eos_ids, types=None, window=32, max_rescues=2, log=sys.stderr,
-                 scan=0):
+    def __init__(self, tok, eos_ids, types=None, window=32, max_rescues=5, log=sys.stderr,
+                 scan=0, think_ids=None):
         self.tok, self.eos_ids, self.types = tok, set(eos_ids), types
         self.scan = max(0, scan)          # 0 = the whole turn (see inside_span rule 4)
         # the token to spell out when the stream itself carried no eos (the resident engine returns on
@@ -160,6 +161,10 @@ class Guard:
         ordered = [int(x) for x in eos_ids]
         self.turn_id = ordered[-1] if ordered else 248046
         self.window, self.max_rescues, self.log = window, max_rescues, log
+        # the thinking-block markers (USER_DEFINED tokens, so they appear in the stream as real ids):
+        # a stop while the most recent of the two is the OPEN tag is a truncation, not an end of turn.
+        t = tuple(int(x) for x in (think_ids or DEFAULT_THINK))
+        self.think_open, self.think_close = t[0], t[1]
 
     def tail_text(self, ids, keep=64):
         """Decode the recent ids the way llama.cpp builds its tail: CONTROL tokens render as
@@ -170,6 +175,18 @@ class Guard:
             recent = [t for t in recent
                       if t >= len(self.types) or self.types[t] != self.CONTROL_TYPE]
         return self.tok.decode(recent)
+
+    def _thinking_open(self, ids):
+        """True when the most recent think tag in `ids` is the OPEN tag: the model is still
+        inside the thinking block, so a stop here is a truncation, not an end of turn.
+
+        Id-based, not text-based: a model QUOTING the tag spells it as character pieces and
+        never emits the single reserved id, so this cannot fire on quoted text.
+        """
+        for t in reversed(ids):
+            if t == self.think_open or t == self.think_close:
+                return t == self.think_open
+        return False
 
     def _note(self, msg, *a):
         print("[control-span] " + (msg % a if a else msg), file=self.log, flush=True)
@@ -237,12 +254,15 @@ class Guard:
             # (b): the stream ended by itself, so a stop short of the cap is an end-of-turn.
             ended_by_stream = stop_id is None and len(produced) + 1 < max_new
             stopping = stop_id is not None or ended_by_stream
-            if not (stopping and inside_span(recent, window=self.window, scan=self.scan)):
+            span = inside_span(recent, window=self.window, scan=self.scan)
+            thinking = self._thinking_open(produced)
+            if not (stopping and (span or thinking)):
                 if stop_id is not None:
                     yield stop_id            # a genuine end of turn: let it end as "stop"
                 return
             if rescues >= self.max_rescues:
-                self._note("stop inside a span, but the rescue cap (%d) is reached - letting it end",
+                self._note("stop %s, but the rescue cap (%d) is reached - letting it end",
+                           "inside an open thinking block" if thinking else "inside a span",
                            self.max_rescues)
                 if stop_id is not None:
                     yield stop_id
@@ -255,8 +275,9 @@ class Guard:
                     yield stop_id
                 return
             rescues += 1
-            self._note("rescue %d: the turn ended inside a span (%s, tail=%r) - continuing with the "
+            self._note("rescue %d: the turn ended %s (%s, tail=%r) - continuing with the "
                        "escaped spelling of token %d as %s", rescues,
+                       "inside an open thinking block" if thinking else "inside a span",
                        "the engine yielded the turn-end id" if stop_id is not None
                        else "the stream ended short of the cap, so a turn-end token",
                        tail[-24:], target, esc)
@@ -271,10 +292,14 @@ def install(server_module, tok, types=None, eos_ids=None, force=False):
     eos = eos_ids or tuple(int(x) for x in
                            (os.environ.get("STRATA_CONTROL_SPAN_EOS") or
                             ",".join(str(e) for e in DEFAULT_EOS)).split(",") if x.strip())
+    think = tuple(int(x) for x in
+                  (os.environ.get("STRATA_CONTROL_SPAN_THINK") or
+                   ",".join(str(x) for x in DEFAULT_THINK)).split(",") if x.strip())
     guard = Guard(tok, eos, types=types,
                   window=_env_int("STRATA_CONTROL_SPAN_WINDOW", 32),
-                  max_rescues=_env_int("STRATA_CONTROL_SPAN_RESCUES", 2),
-                  scan=_env_int("STRATA_CONTROL_SPAN_SCAN", 0))
+                  max_rescues=_env_int("STRATA_CONTROL_SPAN_RESCUES", 5),
+                  scan=_env_int("STRATA_CONTROL_SPAN_SCAN", 0),
+                  think_ids=think)
     cls = server_module.StrataEngine
     original = cls.generate
 
@@ -286,6 +311,6 @@ def install(server_module, tok, types=None, eos_ids=None, force=False):
             return original(self, ids, max_new, sampling, cancel, embeddings)
 
     cls.generate = generate
-    guard._note("ENABLED (eos ids %s, window %d, max rescues %d)",
-                sorted(eos), guard.window, guard.max_rescues)
+    guard._note("ENABLED (eos ids %s, think ids %s, window %d, max rescues %d)",
+                sorted(eos), sorted(think), guard.window, guard.max_rescues)
     return guard

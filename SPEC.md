@@ -4,7 +4,7 @@
 
 The Qwen chat format makes the end-of-turn marker a *single vocabulary id* whose
 characters the model must also **print** when it writes about its own format.  While a
-generation is inside an open quote, an open code span, or a half-typed tag, the model
+generation is inside an open quote, an open code span, a half-typed tag, or an open thinking block, the model
 often samples that id instead of the characters it meant to write.  The engine treats it
 as "turn over", the caller receives a sentence cut mid-word, and the API reports
 `finish_reason: stop` — a truncation with no error.
@@ -27,7 +27,7 @@ No upstream file is modified, so a `git pull` needs no re-apply.
 | 2 | the stream yields `None` | a heartbeat: forward it, never record it as a generated id |
 | 3 | the stream yields a turn-end id | **withhold it** (the consumer breaks on it) and evaluate |
 | 4 | the stream ends with no turn-end id (older builds) and short of the cap | evaluate, using the configured turn-end id |
-| 5 | `inside_span(tail)` and rescues < `max_rescues` | rescue: yield the escaped spelling, re-invoke the engine, loop |
+| 5 | `inside_span(tail)` or the thinking block is open, and rescues < `max_rescues` | rescue: yield the escaped spelling, re-invoke the engine, loop |
 | 6 | otherwise — or the cap is reached, or cancelled | hand the turn-end id over and return, so the caller still gets `stop` |
 
 ## 4. The predicate (`inside_span`)
@@ -55,8 +55,9 @@ would never fire.  The first integration test failed for exactly this reason.
 |---|---|---|
 | `--control-span-guard on\|off` | `STRATA_CONTROL_SPAN_GUARD` | **off** |
 | `--control-span-window N` | `STRATA_CONTROL_SPAN_WINDOW` | 32 |
-| `--control-span-rescues N` | `STRATA_CONTROL_SPAN_RESCUES` | 2 |
+| `--control-span-rescues N` | `STRATA_CONTROL_SPAN_RESCUES` | 5 |
 | — | `STRATA_CONTROL_SPAN_EOS` | `248044,248046` |
+| — | `STRATA_CONTROL_SPAN_THINK` | `248068,248069` |
 
 Start it through your own launch script by exporting `CONTROL_SPAN_GUARD=on` (or pass the flag to
 `serve_with_guard.py` directly).
@@ -67,9 +68,9 @@ The turn-end token escaped on a rescue: the last id in the configured eos list (
 ## 7. Log lines
 
 ```
-[control-span] ENABLED (eos ids [248044, 248046], window 32, max rescues 2)
+[control-span] ENABLED (eos ids [248044, 248046], think ids [248068, 248069], window 32, max rescues 5)
 [control-span] rescue 1: the turn ended inside a span (short of the cap, so a turn-end token, tail='The closing tag is `') - continuing with the escaped spelling of token 248046 as [...]
-[control-span] stop inside a span, but the rescue cap (2) is reached - letting it end
+[control-span] stop inside a span, but the rescue cap (5) is reached - letting it end
 ```
 
 ## 8. Scope
@@ -94,4 +95,5 @@ two bounded continuations, and it is logged.
 | `test_control_span.py` | 14 predicate/escape cases |
 | `test_integration.py` | guard vs Strata's own Service + MockEngine |
 | `test_real_engine_shape.py` | the production shape: an engine that returns on DONE **without** yielding the eos (the bug that made the first version unable to fire), the escape target, the no-rescue controls |
+| `test_thinking_open.py` | the 2026-10-09 case: a stop in plain prose inside an open thinking block is rescued; a stop after the close tag is not; three quoted tags in one thinking block all rescue under the cap of 5; the cap is still enforced |
 | `probe_guard.py` | live A/B prompts against a running instance |
