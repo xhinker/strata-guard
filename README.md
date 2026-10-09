@@ -48,6 +48,21 @@ Everything below was measured on one machine running **two servers side by side 
 model** (Qwen3.8-Flash-Next, IQ3_XXS), the same prompts, `temperature: 0`. One server runs
 without the guard, one with it. Prompts are quoted exactly as sent.
 
+### Before you try these in the chat UI
+
+Open **Settings → Sampling**, set **Thinking: Off** and **Temperature: 0**. With the defaults
+the samples above look identical, and that is not the guard failing:
+
+| | Thinking: High (the UI default) | Thinking: Off |
+|---|---|---|
+| `Write exactly these characters … ```python / print("hi")` | both servers answer `print("hi")` - the model never emits the fence, so there is no open block to rescue | unguarded stops inside the block, guarded continues |
+| a long code-heavy request | answered in full: 10,152 tokens, every block closed | the truncations below |
+
+Thinking changes what the model writes, and in that mode it almost never leaves a span open -
+it writes thousands of reasoning tokens first and closes its own blocks. The guard's job is the
+direct-answer path: agents, code generation, structured output, anything a program is reading.
+That is also the path where a truncated reply costs a retry rather than a second of reading.
+
 One notation note: in these outputs `<\u200b|im_end|>` is the escape the guard inserts.
 `\u200b` is the JSON encoding of U+200B, a zero-width space, so in the raw text it is
 invisible - it shows up as `<` + *(nothing)* + `|im_end|>`.
