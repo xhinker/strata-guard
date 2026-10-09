@@ -270,6 +270,30 @@ comparison - useful for checking a deployment, or for A/B-ing the settings:
 python3 probe_guard.py 8085 "$API_KEY"
 ```
 
+Or run the whole before/after comparison in one command - the same six prompts against both
+servers, with a verdict per case:
+
+```bash
+python3 ab_guard.py HOST_WITHOUT:8086 HOST_WITH:8085 "$API_KEY"
+```
+
+```
+CASE: unclosed fenced code block
+  without guard: finish=stop  rescues=0  '```python\nprint("hi")'
+  with    guard: finish=stop  rescues=2  '```python\nprint("hi")<\u200b|im_end|><\u200b|im_end|>'
+  -> DIFFERS  as expected
+...
+6 of 6 cases behaved as expected.
+```
+
+It prints answers with `repr()` on purpose. The escape contains U+200B, a zero-width space:
+invisible in a terminal, in a browser, and in a diff. Comparing two answers by eye or with
+`diff` is the most common way to conclude there is no difference when there is one. Two other
+ways to miss it: send the prompts with **real newlines** (the escaped `\n` in this README is
+notation, not what to type), and drive the **API** rather than the chat UI - the UI runs with
+thinking enabled, which changes what the model writes and often lets it close its own code
+block, so neither server truncates and there is nothing to see.
+
 ## Tests
 
 ```bash
@@ -308,5 +332,6 @@ writes a lot of code.
 | `control_span.py` | the guard and the predicate |
 | `stats_from_log.py` | optional: reads the engine's own log to fill in usage stats |
 | `probe_guard.py` | live A/B probe against a running server |
+| `ab_guard.py` | the same prompts against two servers, with a verdict per case |
 | `test_*.py` | unit and engine-shaped tests |
 | `SPEC.md` | the design, decision table and the reasoning behind each rule |
