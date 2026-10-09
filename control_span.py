@@ -180,6 +180,12 @@ class Guard:
         """True when the most recent think tag in `ids` is the OPEN tag: the model is still
         inside the thinking block, so a stop here is a truncation, not an end of turn.
 
+        `ids` must be the FULL context (prompt + generated), not just the generated ids:
+        the chat template injects the think-OPEN tag into the PROMPT (the model does not
+        generate it), so scanning only the generated ids is blind to it. Once the model has
+        finished thinking it has emitted a CLOSE tag, which is more recent than the prompt's
+        open tag, so this correctly returns False for a turn that is already answering.
+
         Id-based, not text-based: a model QUOTING the tag spells it as character pieces and
         never emits the single reserved id, so this cannot fire on quoted text.
         """
@@ -255,7 +261,7 @@ class Guard:
             ended_by_stream = stop_id is None and len(produced) + 1 < max_new
             stopping = stop_id is not None or ended_by_stream
             span = inside_span(recent, window=self.window, scan=self.scan)
-            thinking = self._thinking_open(produced)
+            thinking = self._thinking_open(ids + produced)
             if not (stopping and (span or thinking)):
                 if stop_id is not None:
                     yield stop_id            # a genuine end of turn: let it end as "stop"

@@ -62,6 +62,26 @@ class CursorEngine:
         yield TURN_ID
 
 
+class TwoPhaseEngine:
+    """Call 1: stream the thinking then the stop id (a mid-thinking stop).  Call 2 (after the
+    guard's rescue): stream the close tag + the answer, then a genuine stop - the model
+    continues where the guard left it and finishes the turn."""
+
+    def __init__(self, thinking, answer):
+        self.thinking, self.answer, self.calls = thinking, answer, 0
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.calls += 1
+        if self.calls == 1:
+            for t in self.thinking:
+                yield t
+            yield TURN_ID
+        else:
+            for t in [THINK_CLOSE] + self.answer:
+                yield t
+            yield TURN_ID
+
+
 def consume_like_server(gen):
     """serve/server.py's loop: take tokens, and BREAK at the first turn-end id."""
     seen, ended_on_turn_id = [], False
@@ -82,8 +102,10 @@ def run(ids, max_new=512, max_rescues=5):
 
 
 fail = 0
+total = 0
 def check(label, cond):
-    global fail
+    global fail, total
+    total += 1
     fail += 0 if cond else 1
     print(f"  {'PASS' if cond else 'FAIL'}  {label}")
 
@@ -127,5 +149,21 @@ check(f"5 rescues, then the turn is allowed to end ({eng4.calls} engine calls)",
       eng4.calls == 6 and ended4)
 
 print()
-print(f"7 checks, {fail} failures")
+print("think-open tag in the PROMPT, not the generated ids (the real 2026-10-09 case):")
+# In production the chat template injects the think-OPEN tag (248068) into the PROMPT - the
+# model does not generate it. The old guard scanned only the generated ids, so it was blind to
+# the prompt's open tag and let the mid-thinking stop through as a "genuine end" -> content:
+# None.  Now it scans prompt + generated, so it sees the open tag and rescues.
+eng5 = TwoPhaseEngine(tok.encode(prose, parse_special=False),
+                      tok.encode("The answer is 4.", parse_special=False))
+g5 = CS.Guard(tok, CS.DEFAULT_EOS, types=TYPES, max_rescues=5, log=sys.stderr)
+seen5, ended5 = consume_like_server(
+    g5.guard(eng5.generate, [THINK_OPEN] + tok.encode("q", parse_special=False), 512, {}, threading.Event()))
+out5 = tok.decode(seen5)
+check(f"rescued even though the open tag is in the prompt ({eng5.calls} engine calls)",
+      eng5.calls == 2 and ended5)
+check("the turn completed with the answer, not truncated", "The answer is 4." in out5)
+
+print()
+print(f"{total} checks, {fail} failures")
 raise SystemExit(1 if fail else 0)
