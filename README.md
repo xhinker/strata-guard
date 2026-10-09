@@ -1,5 +1,9 @@
 # strata-guard
 
+[![tests](https://github.com/xhinker/strata-guard/actions/workflows/tests.yml/badge.svg)](https://github.com/xhinker/strata-guard/actions/workflows/tests.yml)
+![python](https://img.shields.io/badge/python-3.10%2B-blue)
+![platform](https://img.shields.io/badge/runs_on-Strata%20%2B%20Qwen-informational)
+
 **Your model stops mid-sentence, and the API says everything is fine.**
 
 A Qwen model's end-of-turn token is also a *string it can type*: `<|im_end|>`. When the model
@@ -18,6 +22,25 @@ engine at the server layer: no C++ changes, no engine fork, no retraining, no cl
 without the guard:  '```python\nprint("hi")'
 with the guard   :  '```python\nprint("hi")<\u200b|im_end|>'   and the turn continues
 ```
+
+## Contents
+
+- [What it fixes, with real output](#what-it-fixes-with-real-output) - five measured before/after pairs
+- [Using it with your Strata instance](#using-it-with-your-strata-instance) - one flag, plus the options
+- [How it works](#how-it-works) - and why each rule is shaped the way it is
+- [Try it with curl](#try-it-with-curl) - reproduce it in one request
+
+## Quick start
+
+```bash
+git clone https://github.com/xhinker/strata-guard.git
+cd "$STRATA_ROOT"
+STRATA_ROOT="$STRATA_ROOT" .venv/bin/python ../strata-guard/serve_with_guard.py     --engine strata --config your-config.json --port 8080 --control-span-guard on
+```
+
+If it took, the first line you see is `[control-span] ENABLED (...)`. Everything below is the
+detail: what it changes, what it deliberately leaves alone, and how to check it on your own
+deployment.
 
 ## What it fixes, with real output
 
@@ -260,6 +283,22 @@ The last one matters most. A guard on a generator is only as alive as its consum
 tests drive it the way the real server does - breaking at the first turn-end id, and emitting
 `None` heartbeats while idle. A test that runs the generator to exhaustion proves the logic and
 nothing about production.
+
+The first file needs nothing but Python and runs on every push in CI. The other three need a
+real Strata install and its tokenizer, which is what makes them worth having: they exercise the
+guard against the engine's actual output shape, not a convenient one.
+
+## Contributing
+
+The two things that move this project forward are more measured pairs like the ones above -
+a prompt, the output without the guard, the output with it - and test cases for the predicate.
+If you hit a reply that the guard should have rescued and did not, or one it rescued and
+should not have, open an issue with the prompt and both outputs: that is the whole bug report.
+
+Settings worth experimenting with are `--control-span-rescues` and `--control-span-window`.
+The defaults were chosen on one model on one machine; they are very likely not right for every
+model, and a predicate tuned for a model that writes a lot of prose will misjudge one that
+writes a lot of code.
 
 ## Files
 
