@@ -15,8 +15,8 @@ backtick.
     ```python
     print("hi")          <- the answer stops here, inside the code block
 
-strata-guard notices and asks for the rest. It is ~250 lines of Python that wraps Strata's
-engine at the server layer: no C++ changes, no engine fork, no retraining, no client changes.
+strata-guard notices and asks for the rest. It is under 500 lines of Python - the guard
+itself is 291 - that wraps Strata's engine at the server layer: no C++ changes, no engine fork, no retraining, no client changes.
 
 ```
 without the guard:  '```python\nprint("hi")'
