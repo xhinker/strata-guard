@@ -68,11 +68,11 @@ def _open_code_span(text: str) -> bool:
     backtick, so it must not open anything - that case is a test on purpose.
     """
     i, n = 0, len(text)
-    fence = None          # the fence character while inside a ``` / ~~~ block
+    fence = None          # the fence character while inside a ``` block (backticks only)
     inline = False
     while i < n:
         c = text[i]
-        if c not in ("`", "~"):
+        if c != "`":
             i += 1
             continue
         j = i

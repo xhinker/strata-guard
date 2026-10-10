@@ -33,6 +33,10 @@ PARITY = [
     ('the model wrote `x` and stopped', False, "closed inline span, prose after it"),
     ('a fence marker inside a block:\n' + F3 + 'a\n' + F3 + ' is fine', False, "two closed blocks"),
     (F3 + 'python\n' + 'y' * 3000, True, "a long block is still open over the whole turn"),
+    # tildes are not code markers: an approximation sign must never open a span (2026-10-10)
+    ('That is another ~450 words, landing near 3,100.', False, "tilde as an approximation sign"),
+    ('the Q2_0 ~40 GB repack is one-time.', False, "tilde before a number opens nothing"),
+    ('~~~' + chr(10) + 'unclosed tilde fence' + chr(10), False, "tildes ignored entirely (behaviour change)"),
 ]
 
 # --- why rule 4 is not windowed (the artifact a window creates) ---
