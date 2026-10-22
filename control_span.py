@@ -249,6 +249,7 @@ class Guard:
         """
         produced: list[int] = []
         rescues = 0
+        rescued_at = None       # len(produced) right after the last escape (one-shot per span)
         while True:
             budget = max(1, max_new - len(produced))
             gen = engine(ids + produced, budget, sampling, cancel, embeddings)
@@ -288,6 +289,18 @@ class Guard:
                 if stop_id is not None:
                     yield stop_id            # a genuine end of turn: let it end as "stop"
                 return
+
+            # ONE-SHOT PER SPAN: the escape just injected is a complete rendering of what
+            # the model wanted to print.  A stop with nothing new in between is the same
+            # intent expressed again - honour it instead of appending another copy (which
+            # is how one quoted marker used to become five).
+            if rescued_at is not None and len(produced) == rescued_at:
+                self._note("stop %s, but nothing was written after rescue %d - letting it end",
+                           "inside an open thinking block" if thinking else "inside a span",
+                           rescues)
+                if stop_id is not None:
+                    yield stop_id
+                return
             if rescues >= self.max_rescues:
                 self._note("stop %s, but the rescue cap (%d) is reached - letting it end",
                            "inside an open thinking block" if thinking else "inside a span",
@@ -312,6 +325,7 @@ class Guard:
             for t in esc:                    # the caller sees the escaped text
                 produced.append(t)
                 yield t
+            rescued_at = len(produced)      # snapshot AFTER the escape: 'nothing new' is measured from here
 
 def install(server_module, tok, types=None, eos_ids=None, force=False):
     """Monkey-patch StrataEngine.generate. Returns the guard object (or None if off)."""

@@ -62,6 +62,23 @@ class CursorEngine:
         yield TURN_ID
 
 
+class GrowingEngine:
+    """Every call writes one more token, then the turn-end id: there is always new output,
+    so every rescue is legitimate and only the cap can end it (the one-shot rule does not
+    apply - see test_one_shot_rescue.py for the nothing-new case)."""
+
+    def __init__(self, first):
+        self.first = list(first)
+        self.calls = 0
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.calls += 1
+        seq = self.first if self.calls == 1 else tok.encode("y" * self.calls, parse_special=False)
+        for t in seq[:max_new]:
+            yield t
+        yield TURN_ID
+
+
 class TwoPhaseEngine:
     """Call 1: stream the thinking then the stop id (a mid-thinking stop).  Call 2 (after the
     guard's rescue): stream the close tag + the answer, then a genuine stop - the model
@@ -143,8 +160,11 @@ check(f"both stop-quotes rescued, turn ends cleanly ({eng3.calls} engine calls)"
 check("two escapes in the answer, no bare turn-end id leaked mid-answer",
       out3.count("\u200b") == 2 and seen3.count(TURN_ID) == 1)
 
-print("\nrescue cap still enforced (a model that never closes thinking, cap 5):")
-seen4, ended4, eng4 = run([THINK_OPEN] + tok.encode("x", parse_special=False), max_rescues=5)
+print("\nrescue cap still enforced (a model that keeps writing new output, cap 5):")
+eng4 = GrowingEngine([THINK_OPEN] + tok.encode("x", parse_special=False))
+g4 = CS.Guard(tok, CS.DEFAULT_EOS, types=TYPES, max_rescues=5, log=sys.stderr)
+seen4, ended4 = consume_like_server(
+    g4.guard(eng4.generate, tok.encode("hi", parse_special=False), 256, {}, threading.Event()))
 check(f"5 rescues, then the turn is allowed to end ({eng4.calls} engine calls)",
       eng4.calls == 6 and ended4)
 
