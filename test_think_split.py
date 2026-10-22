@@ -55,3 +55,53 @@ for label, reserved, want in (("reserved id", True, "RESERVED"), ("spelled piece
     for line in out.splitlines():
         if "reasoning -> content" in line:
             print("        " + line)
+
+
+# ---- strict mode: a QUOTED marker must not split the turn -------------------
+ZWSP = "\u200b"
+
+
+def trial2(reserved: bool, mode: str):
+    """Run a whole turn through the real parser with the module installed in `mode`."""
+    if reserved:
+        table, pieces = {7: "<" + "/think>", 9: "answer"}, [7, 9]
+    else:                                    # the marker spelled out of ordinary tokens
+        table, pieces = {1: "<", 2: "/think>", 9: "answer"}, [1, 2, 9]
+    tok = ByteTok(table)
+    S.Detokenizer = type("D", (Detok,), {})
+    S.OutputParser = type("P", (OutputParser,), {})
+    TS.install(S, tok, mode=mode)
+    d, p = S.Detokenizer(tok), S.OutputParser(thinking=True, tools=None)
+    evs, buf = [], io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        for t in pieces:
+            evs += p.feed(d.push(t)) or []
+    return evs, p.state, buf.getvalue()
+
+
+strict_cases = [
+    ("strict + reserved id: the split stands, nothing injected", True,
+     lambda evs, st: st == "content"
+     and any(e.kind == "content" and e.text == "answer" for e in evs)
+     and not any(ZWSP in e.text for e in evs)),
+    ("strict + spelled marker: turn stays REASONING, marker re-escaped", False,
+     lambda evs, st: st == "reasoning"
+     and not any(e.kind == "content" for e in evs)
+     and any(e.kind == "reasoning" and ZWSP in e.text for e in evs)
+     and any(e.kind == "reasoning" and "answer" in e.text for e in evs)),
+]
+
+print()
+fails = 0
+for label, reserved, check in strict_cases:
+    evs, st, log = trial2(reserved, "strict")
+    ok = bool(check(evs, st))
+    fails += 0 if ok else 1
+    print(("  ok   " if ok else "  FAIL ") + label)
+    print(f"        state={st}  events={[(e.kind, e.text) for e in evs]}")
+    for line in log.splitlines():
+        if "strict:" in line or "reasoning -> content" in line:
+            print("        " + line)
+
+print(f"\n  {len(strict_cases)} strict cases, {fails} failures")
+sys.exit(1 if fails else 0)
