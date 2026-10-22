@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(STRATA) / "tools"))   # strata_tokenizer lives here 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import control_span  # noqa: E402
+import think_split  # noqa: E402
 import stats_from_log  # noqa: E402
 
 
@@ -149,6 +150,13 @@ def main() -> int:
         print("[control-span] no pack/tokenizer - the guard stays off", file=sys.stderr)
     else:
         control_span.install(S, tok, types=types)
+    # STRATA_THINK_SPLIT=log|off: record which id closed the thinking block
+    # (no behaviour change; says whether a marker was the reserved id or spelled)
+    if tok is not None:
+        try:
+            think_split.install(S, tok)
+        except Exception as exc:
+            print(f"[think-split] not installed: {exc}", file=sys.stderr)
     # the Monitor's per-request figures: fill engine.last from the engine's own summary line.
     # Installed AFTER the guard, so its finally runs last (after any rescue has finished).
     log_path = os.environ.get("STRATA_STATS_LOG") or _config_log(argv)

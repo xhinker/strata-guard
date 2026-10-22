@@ -176,6 +176,28 @@ class Guard:
                       if t >= len(self.types) or self.types[t] != self.CONTROL_TYPE]
         return self.tok.decode(recent)
 
+    def answer_text(self, produced):
+        """Decode the ANSWER only - everything after the most recent think-CLOSE tag, with
+        no id cap.  Two artifacts this avoids, both measured on 2026-10-10:
+
+        (1) tail_text caps at its last `keep` ids (64).  A window that starts INSIDE a
+            code block reads that block's CLOSING fence as an OPENING one, so a complete
+            answer looks truncated: for the answer that triggered this, keep=64 said True
+            and keep=128, keep=256 and the full length all said False.  inside_span's own
+            rule 4 says parity is only meaningful over the whole turn, so the span check
+            must not be handed a 64-id slice.
+        (2) The reasoning block is prose ABOUT code - inline backticks, nested quoting,
+            runs of three from quoting quoted text - and its backtick parity says nothing
+            about whether the answer is complete.  A stop while thinking is still open is
+            already handled by _thinking_open, which is id-based and stays on the full
+            context."""
+        k = -1
+        for i, t in enumerate(produced):
+            if t == self.think_close:
+                k = i
+        tail = produced[k + 1:]
+        return self.tail_text(tail, keep=max(1, len(tail)))
+
     def _thinking_open(self, ids):
         """True when the most recent think tag in `ids` is the OPEN tag: the model is still
         inside the thinking block, so a stop here is a truncation, not an end of turn.
@@ -255,7 +277,7 @@ class Guard:
             if not produced and stop_id is None:
                 return
 
-            recent = self.tail_text(produced)[-self.scan:]
+            recent = self.answer_text(produced)[-self.scan:]
             tail = recent[-self.window:]
             # (b): the stream ended by itself, so a stop short of the cap is an end-of-turn.
             ended_by_stream = stop_id is None and len(produced) + 1 < max_new
