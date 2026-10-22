@@ -41,8 +41,10 @@ spell. When the model is inside a code block, a quote, or a tag it is halfway th
 chance of typing it goes up — and it stops. The server sees a legitimate turn-end id, so
 `finish_reason` is `"stop"`, HTTP is 200, and the answer ends at a backtick:
 
-    ```python
-    print("hi")          <- the answer stops here, inside the code block
+````text
+```python
+print("hi")          <- the answer stops here, inside the code block
+````
 
 Nothing in the logs looks wrong. Anything downstream that parses the answer as markdown, extracts a
 code block, or feeds the transcript back in as history gets a truncated result.
@@ -60,18 +62,36 @@ The text cannot tell them apart. **The token id can.** That single observation i
 ### What it fixes, measured
 
 One machine, two servers side by side, same model (Qwen3.8-Flash-Next, IQ3_XXS), same prompts,
-`temperature: 0`. Prompts quoted exactly as sent. `<​|im_end|>` below is the escape the guard
-inserts: `<`, U+200B, `|im_end|>` — invisible when rendered, visible in `repr()` and in JSON as
-`<\u200b|im_end|>`.
+`temperature: 0`. Answers are shown as `repr()`, deliberately: the escape the guard inserts contains
+U+200B, which is invisible in a terminal, a browser and a diff. In the output below `<\u200b|im_end|>`
+**is** that escape - the characters `<`, U+200B, `|im_end|>` - and it is the only difference between
+the two lines of every pair.
 
-| prompt (…and then stop, adding nothing:) | without the guard | with the guard |
-|---|---|---|
-| `` ```python ⏎ print("hi") `` | `` ```python\nprint("hi") `` | `` ```python\nprint("hi")<​|im_end|> `` |
-| `` the operator ` is used `` | `` the operator ` is used `` | `` the operator ` is used<​|im_end|> `` |
-| `<|im` | `<|im` | `<|im<​|im_end|>` |
-| `She said "hello` | `She said "hello` | `She said "hello<​|im_end|>` |
-| a **closed** code block | unchanged | unchanged |
-| `Hello there.` | unchanged | unchanged |
+````text
+1. an unclosed fenced code block
+   prompt:   ...and then stop, adding nothing:  ```python / print("hi")
+   without:  '```python\nprint("hi")'
+   with:     '```python\nprint("hi")<\u200b|im_end|>'
+
+2. an inline code span opened mid-sentence
+   prompt:   ...and then stop, adding nothing: the operator ` is used
+   without:  'the operator ` is used'
+   with:     'the operator ` is used<\u200b|im_end|>'
+
+3. a half-typed control tag
+   prompt:   ...and then stop, adding nothing: <|im
+   without:  '<|im'
+   with:     '<|im<\u200b|im_end|>'
+
+4. an unbalanced quote
+   prompt:   ...and then stop, adding nothing: She said "hello
+   without:  'She said "hello'
+   with:     'She said "hello<\u200b|im_end|>'
+
+   negative controls - both servers identical, the guard does not intervene:
+   ...adding nothing: ```python / print("hi") / ```      a CLOSED code block
+   ...adding nothing: Hello there.                       finished prose
+````
 
 `finish_reason` stays `stop` in every case — a rescue never turns a clean stop into a `length`
 truncation, and closed blocks and finished sentences are left alone.
