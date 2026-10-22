@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 *.log
+
+# local backups and snapshots - never commit
+baks/
+*.bak-*
+*.pre-*
