@@ -2,157 +2,95 @@
 
 [![tests](https://github.com/xhinker/strata-guard/actions/workflows/tests.yml/badge.svg)](https://github.com/xhinker/strata-guard/actions/workflows/tests.yml)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
-![platform](https://img.shields.io/badge/runs_on-Strata%20%2B%20Qwen-informational)
+![license](https://img.shields.io/badge/license-MIT-blue)
 
 **Your model stops mid-sentence, and the API says everything is fine.**
 
-A Qwen model's end-of-turn token is also a *string it can type*: `<|im_end|>`. When the model
-is inside a code block, a quote, or a tag it is half way through writing, the probability of
-typing that literal goes up - and it stops. The server sees a legitimate turn-end token, so
-`finish_reason` is `"stop"`, the HTTP status is 200, and the answer you get ends at a
-backtick.
+`strata-guard` is a small guard that sits in front of [Strata](https://github.com/Niko1221/Strata)'s
+OpenAI-compatible server and fixes two ways a turn gets cut short. It patches the server process
+from the outside: no C++ changes, no engine fork, no retraining, no client changes. Remove the flag
+and you are back to stock behaviour.
+
+478 lines of intervention logic (`control_span.py` + `think_split.py`), plus the drop-in launcher
+and the tools that measure it.
+
+---
+
+## 1. What this is
+
+A drop-in replacement for `serve/server.py` — `serve_with_guard.py` — that starts the same server,
+with the same arguments, and installs two guards into it:
+
+| guard | file | catches |
+|---|---|---|
+| **control-span guard** | `control_span.py` | a turn that ends while a code block, code span, quote or tag is still open |
+| **think-split guard** | `think_split.py` | a reasoning block that ends because the model *quoted* the closing marker |
+
+Both work on the token **id** stream, not on the rendered text, which is what makes them reliable —
+see [how it works](#4-how-it-works-internally).
+
+It is not an engine patch, a sampler, or a retry loop. It does not change what the model writes; it
+refuses to accept two specific kinds of "the turn is over" that aren't.
+
+## 2. The two problems it solves
+
+### Problem 1 — the end-of-turn token is also a string the model can type
+
+Qwen's turn-end token is a string that exists in the vocabulary *and* as characters the model can
+spell. When the model is inside a code block, a quote, or a tag it is halfway through writing, the
+chance of typing it goes up — and it stops. The server sees a legitimate turn-end id, so
+`finish_reason` is `"stop"`, HTTP is 200, and the answer ends at a backtick:
 
     ```python
     print("hi")          <- the answer stops here, inside the code block
 
-strata-guard notices and asks for the rest. It is under 500 lines of Python - the guard
-itself is 291 - that wraps Strata's engine at the server layer: no C++ changes, no engine fork, no retraining, no client changes.
+Nothing in the logs looks wrong. Anything downstream that parses the answer as markdown, extracts a
+code block, or feeds the transcript back in as history gets a truncated result.
 
-```
-without the guard:  '```python\nprint("hi")'
-with the guard   :  '```python\nprint("hi")<\u200b|im_end|>'   and the turn continues
-```
+### Problem 2 — a quoted thinking marker ends the reasoning block
 
-## Contents
+Strata splits reasoning from answer by watching for the **text** of the closing thinking marker. A
+model that *quotes* that marker while reasoning — explaining how a chat template closes its thinking
+block, say — writes the same characters. From the text side the two are identical, so the split
+fires early and the rest of the reasoning is delivered as the answer.
 
-- [What it fixes, with real output](#what-it-fixes-with-real-output) - five measured before/after pairs
-- [Using it with your Strata instance](#using-it-with-your-strata-instance) - one flag, plus the options
-- [How it works](#how-it-works) - and why each rule is shaped the way it is
-- [Try it with curl](#try-it-with-curl) - reproduce it in one request
+The text cannot tell them apart. **The token id can.** That single observation is the whole design of
+`think_split.py`.
 
-## Quick start
+### What it fixes, measured
+
+One machine, two servers side by side, same model (Qwen3.8-Flash-Next, IQ3_XXS), same prompts,
+`temperature: 0`. Prompts quoted exactly as sent. `<​|im_end|>` below is the escape the guard
+inserts: `<`, U+200B, `|im_end|>` — invisible when rendered, visible in `repr()` and in JSON as
+`<\u200b|im_end|>`.
+
+| prompt (…and then stop, adding nothing:) | without the guard | with the guard |
+|---|---|---|
+| `` ```python ⏎ print("hi") `` | `` ```python\nprint("hi") `` | `` ```python\nprint("hi")<​|im_end|> `` |
+| `` the operator ` is used `` | `` the operator ` is used `` | `` the operator ` is used<​|im_end|> `` |
+| `<|im` | `<|im` | `<|im<​|im_end|>` |
+| `She said "hello` | `She said "hello` | `She said "hello<​|im_end|>` |
+| a **closed** code block | unchanged | unchanged |
+| `Hello there.` | unchanged | unchanged |
+
+`finish_reason` stays `stop` in every case — a rescue never turns a clean stop into a `length`
+truncation, and closed blocks and finished sentences are left alone.
+
+**Try them through the API, not the chat UI.** The UI runs with thinking enabled, which changes what
+the model writes: it writes thousands of reasoning tokens first and closes its own blocks, so neither
+server truncates and there is nothing to see. The guard's target is the direct-answer path — agents,
+code generation, structured output, anything a program is reading.
+
+## 3. Running it with your Strata
+
+Requirements: a working Strata install with its Python server and a Qwen-family model. Nothing else.
 
 ```bash
 git clone https://github.com/xhinker/strata-guard.git
-cd "$STRATA_ROOT"
-STRATA_ROOT="$STRATA_ROOT" .venv/bin/python ../strata-guard/serve_with_guard.py     --engine strata --config your-config.json --port 8080 --control-span-guard on
 ```
 
-If it took, the first line you see is `[control-span] ENABLED (...)`. Everything below is the
-detail: what it changes, what it deliberately leaves alone, and how to check it on your own
-deployment.
-
-## What it fixes, with real output
-
-Everything below was measured on one machine running **two servers side by side with the same
-model** (Qwen3.8-Flash-Next, IQ3_XXS), the same prompts, `temperature: 0`. One server runs
-without the guard, one with it. Prompts are quoted exactly as sent.
-
-### Before you try these in the chat UI
-
-Open **Settings → Sampling**, set **Thinking: Off** and **Temperature: 0**. With the defaults
-the samples above look identical, and that is not the guard failing:
-
-| | Thinking: High (the UI default) | Thinking: Off |
-|---|---|---|
-| `Write exactly these characters … ```python / print("hi")` | both servers answer `print("hi")` - the model never emits the fence, so there is no open block to rescue | unguarded stops inside the block, guarded continues |
-| a long code-heavy request | answered in full: 10,152 tokens, every block closed | the truncations below |
-
-Thinking changes what the model writes, and in that mode it almost never leaves a span open -
-it writes thousands of reasoning tokens first and closes its own blocks. The guard's job is the
-direct-answer path: agents, code generation, structured output, anything a program is reading.
-That is also the path where a truncated reply costs a retry rather than a second of reading.
-
-One notation note: in these outputs `<\u200b|im_end|>` is the escape the guard inserts.
-`\u200b` is the JSON encoding of U+200B, a zero-width space, so in the raw text it is
-invisible - it shows up as `<` + *(nothing)* + `|im_end|>`.
-
-### 1. An unclosed fenced code block
-
-```
-prompt:   Write exactly these characters and then stop, adding nothing:
-          ```python
-          print("hi")
-```
-
-| | output | `finish_reason` |
-|---|---|---|
-| **without the guard** | `` ```python\nprint("hi") `` | `stop` |
-| **with the guard** | `` ```python\nprint("hi")<\u200b|im_end|> `` | `stop` |
-
-**Symptom without the guard:** the reply ends inside a code block. Markdown renderers show an
-open fence to the end of the message, and anything that parses the answer as markdown or
-extracts the code gets a truncated block. Nothing in the logs looks wrong.
-
-### 2. An inline code span opened mid-sentence
-
-```
-prompt:   Write exactly these characters and then stop, adding nothing: the operator ` is used
-```
-
-| | output | `finish_reason` |
-|---|---|---|
-| **without the guard** | `` the operator ` is used `` | `stop` |
-| **with the guard** | `` the operator ` is used<\u200b|im_end|> `` | `stop` |
-
-**Symptom without the guard:** the model opened an inline span earlier in the sentence and
-stopped later in it. A rule that only looks at the *end* of the reply cannot see this - the
-backtick is not at the end - so it needs a parity check over the whole turn.
-
-### 3. A half-typed control tag
-
-```
-prompt:   Write exactly these characters and then stop, adding nothing: <|im
-```
-
-| | output | `finish_reason` |
-|---|---|---|
-| **without the guard** | `<|im` | `stop` |
-| **with the guard** | `<|im<\u200b|im_end|>` | `stop` |
-
-**Symptom without the guard:** the answer ends on a dangling `<`. This is the case that also
-breaks the *client*: an unterminated tag in the middle of a chat transcript can be re-read as
-markup by whatever consumes the answer.
-
-### 4. An unbalanced quote
-
-```
-prompt:   Write exactly these characters and then stop, adding nothing: She said "hello
-```
-
-| | output | `finish_reason` |
-|---|---|---|
-| **without the guard** | `She said "hello` | `stop` |
-| **with the guard** | `She said "hello<\u200b|im_end|>` | `stop` |
-
-### 5. What it deliberately leaves alone
-
-The same probe set, negative controls, both servers:
-
-```
-prompt:   ... adding nothing: ```python\nprint("hi")\n```        (a CLOSED code block)
-          both servers -> '```python\nprint("hi")\n```'          not rescued
-
-prompt:   ... adding nothing: Hello there.                        (plain prose)
-          both servers -> 'Hello there.'                         not rescued
-```
-
-A closed code block and a finished sentence are legitimate endings. The guard does not touch
-them, and `finish_reason` stays `stop` in every case above - a rescue never turns a clean
-stop into a `length` truncation.
-
-## Using it with your Strata instance
-
-Requirements: a working [Strata](https://github.com/Niko1221/Strata) install with its Python server
-(`serve/server.py`) and a Qwen-family model. Nothing else.
-
-```bash
-git clone https://github.com/xhinker/strata-guard.git
-cd strata-guard
-```
-
-Start Strata through `serve_with_guard.py` instead of `serve/server.py`, with the same
-arguments you already use, plus one flag:
+Start Strata through `serve_with_guard.py` instead of `serve/server.py`, with the arguments you
+already use plus one flag:
 
 ```bash
 cd "$STRATA_ROOT"
@@ -161,98 +99,33 @@ STRATA_ROOT="$STRATA_ROOT" .venv/bin/python /path/to/strata-guard/serve_with_gua
     --control-span-guard on
 ```
 
-That is the whole integration. The patch lives in this process only - no upstream file is
-modified, and if you remove the flag you are back to stock behaviour.
-
-You should see this line at startup:
+If it took, the first lines are:
 
 ```
 [control-span] ENABLED (eos ids [248044, 248046], think ids [248068, 248069], window 32, max rescues 5)
+[think-split] ENABLED (strict; the pack's reserved marker id is 248069)
 ```
+
+No upstream file is touched; the patch lives in that process only.
 
 ### Options
 
 | flag | environment variable | default | meaning |
 |---|---|---|---|
-| `--control-span-guard on\|off` | `STRATA_CONTROL_SPAN_GUARD` | `off` | enable the guard |
-| `--control-span-window N` | `STRATA_CONTROL_SPAN_WINDOW` | `32` | characters inspected at the end of the reply (rules 1-3) |
+| `--control-span-guard on\|off` | `STRATA_CONTROL_SPAN_GUARD` | `off` | enable the control-span guard |
+| `--control-span-window N` | `STRATA_CONTROL_SPAN_WINDOW` | `32` | characters inspected at the end of the reply (rules 1–3) |
 | `--control-span-rescues N` | `STRATA_CONTROL_SPAN_RESCUES` | `5` | maximum rescues per request |
 | `--control-span-scan N` | `STRATA_CONTROL_SPAN_SCAN` | `0` | characters scanned for an open code span/block; `0` = the whole turn |
-| `--control-span-eos IDS` | `STRATA_CONTROL_SPAN_EOS` | `248044,248046` | turn-end token ids (Qwen3 / Qwen3.5 / Qwen3.8) |
-| `--control-span-think IDS` | `STRATA_CONTROL_SPAN_THINK` | `248068,248069` | think open/close token ids (Qwen3 / Qwen3.5 / Qwen3.8) |
+| `--control-span-eos IDS` | `STRATA_CONTROL_SPAN_EOS` | `248044,248046` | turn-end token ids (Qwen3 / 3.5 / 3.8) |
+| `--control-span-think IDS` | `STRATA_CONTROL_SPAN_THINK` | `248068,248069` | think open/close token ids |
+| | `STRATA_THINK_SPLIT=strict\|log\|off` | `off` | `strict` undoes a quoted-marker split; `log` only records which id closed the block; `off` installs nothing |
 
-## How it works
+`strict` is the mode to run; `log` is what to run first if you want to see how often each branch
+fires on your model before you change behaviour.
 
-The guard wraps the engine's token generator. It watches the id stream, and when the engine
-produces a **turn-end id** it does not pass it on immediately - it holds it back and decides:
+### Checking it on your deployment
 
-```
-1. forward everything the engine yields, including the None heartbeats it emits while idle
-2. on a turn-end id: hold it back, decode the recent text, evaluate the predicate
-3. inside a span or an open thinking block -> yield the ESCAPED spelling of the turn-end token,
-                     re-invoke the engine, and go back to step 1  (up to --control-span-rescues times)
-4. not inside one -> hand the held turn-end id over, so the caller still sees a normal stop
-```
-
-The predicate says "inside a span" when the text ends with:
-
-1. an odd number of `"` in the last N characters, or
-2. a `|`, or an opening backtick, or
-3. a `<` with no `>` and no whitespace after it, or
-4. **an open code block or code span anywhere in the turn** - a fenced block the model never
-   closed, or an inline span it opened earlier and left open, or
-5. **the thinking block is still open** - the most recent think tag in the generated ids is
-   the open tag (248068). A stop there is a truncation, never an end of turn. Id-based, not
-   text-based: a model quoting the tag spells it as character pieces and never emits the
-   reserved id, so this cannot fire on quoted text.
-
-Rules 1-3 are deliberately local: global quote parity was tried, and one lone quote several
-hundred characters back kept the guard intervening forever. Rule 4 cannot be local, because a
-code block is longer than any tail - and it cannot be windowed either. A window that starts
-*inside* a code block sees that block's closing fence as an opening one, and reports a
-perfectly closed answer as an open span. Parity is only meaningful over the whole turn, which
-is why `--control-span-scan` defaults to `0`.
-
-### Why the escape, and not the token itself
-
-The model stops early because the turn-end token is a string it can type. So the guard cannot
-push it back through the door it just came in through: it appends the **escaped spelling** -
-`<` + U+200B + `|im_end|>` - which is a sequence of ordinary characters that cannot
-re-tokenise into the reserved id. It reads to the model as "you wrote the tag as text", which
-is a hint, not a stop. The zero-width space is the same escaping used for control tokens in
-the prompt itself, so the model has already seen this convention.
-
-### Why the turn-end id is held back rather than dropped
-
-The server ends a turn the moment it sees a stop id:
-
-```python
-if t in self.stop_ids:
-    finish = "stop"
-    break
-```
-
-That `break` closes the wrapping generator where it is sitting. A guard that only inspects the
-stream *after* its own loop never runs in production - which is why the decision has to happen
-**at** the stop id, and why the id has to be handed back on a normal ending: otherwise the
-client's `finish_reason` silently degrades from `stop` to `length`.
-
-### What it does not do
-
-- It only sees stops caused by the **turn-end token**. A reply ended by an OpenAI `stop`
-  string, a degenerate-repeat stop, or the engine's loop recovery is a different code path.
-- It does not touch `max_tokens` truncation. A reply that hits the token budget is not a
-  control-span stop, and rescuing it would be wrong.
-- It cannot recover a reply that the model genuinely believed was finished. If the model
-  stopped inside a quote because it *meant* to, the guard spends up to N extra engine calls
-  and appends the escape. That is the cost, bounded by `--control-span-rescues`.
-- It changes the answer text by the escape sequence. If you would rather the client never see
-  it, set `--control-span-rescues 1` to keep the artifact to a single occurrence, or filter
-  `<` + U+200B + `|im_end|>` client-side.
-
-## Try it with curl
-
-Against a server **without** the guard:
+One request, against a server **without** the guard:
 
 ```bash
 curl -s http://127.0.0.1:8086/v1/chat/completions \
@@ -262,19 +135,17 @@ curl -s http://127.0.0.1:8086/v1/chat/completions \
 ```
 
 ```json
-{"choices": [{"finish_reason": "stop",
-              "message": {"content": "the operator ` is used"}}]}
+{"choices": [{"finish_reason": "stop", "message": {"content": "the operator ` is used"}}]}
 ```
 
-The same request against a server **with** the guard:
+The same request against a server **with** it:
 
 ```json
 {"choices": [{"finish_reason": "stop",
               "message": {"content": "the operator ` is used<\u200b|im_end|><\u200b|im_end|>"}}]}
 ```
 
-`\u200b` is the JSON encoding of the zero-width space: in the raw text it is invisible, and it
-is what tells you a rescue happened. The server logs the same thing, with the reason:
+The server logs the reason, so a rescue is never silent:
 
 ```
 [control-span] rescue 1: the turn ended inside a span (the engine yielded the turn-end id,
@@ -283,75 +154,150 @@ is what tells you a rescue happened. The server logs the same thing, with the re
 [control-span] stop inside a span, but the rescue cap (2) is reached - letting it end
 ```
 
-`probe_guard.py` runs a positive and negative set against any two servers and prints the
-comparison - useful for checking a deployment, or for A/B-ing the settings:
+Two tools do the comparison for you:
 
 ```bash
-python3 probe_guard.py 8085 "$API_KEY"
+python3 probe_guard.py 8085 "$API_KEY"                        # positive + negative set against one server
+python3 ab_guard.py HOST_WITHOUT:8086 HOST_WITH:8085 "$API_KEY"   # same prompts, both servers, verdict per case
+python3 probe_think_split.py --url http://127.0.0.1:8084/v1 --tmux strata   # provoke a quoted marker, show the log
 ```
 
-Or run the whole before/after comparison in one command - the same six prompts against both
-servers, with a verdict per case:
+`ab_guard.py` prints answers with `repr()` deliberately: the escape contains a zero-width space,
+invisible in a terminal, a browser and a diff. Comparing answers by eye is the usual way to conclude
+there is no difference when there is one.
+
+## 4. How it works internally
+
+### Holding the stop back instead of dropping it
+
+The guard wraps the engine's token generator. It forwards everything the engine yields — including
+the `None` heartbeats it emits while idle — and when a **turn-end id** arrives it does not pass it
+on. It holds it and decides:
+
+```
+on a turn-end id: hold it, decode the text, evaluate the predicate
+  inside a span / open thinking block -> yield the ESCAPED spelling of the turn-end token,
+                                        re-invoke the engine, continue   (up to --control-span-rescues)
+  otherwise                           -> hand the held id back, so the caller sees a normal stop
+```
+
+Why the decision has to happen *at* the stop id: the server ends a turn the moment it sees one —
+
+```python
+if t in self.stop_ids:
+    finish = "stop"
+    break
+```
+
+— and that `break` closes the wrapping generator where it is sitting. A guard that inspects the
+stream *after* its own loop never runs in production. And the held id must be handed back on a
+normal ending, or the client's `finish_reason` silently degrades from `stop` to `length`.
+
+### The predicate
+
+"Inside a span" is true when the turn ends with:
+
+1. an odd number of `"` in the last N characters, or
+2. a `|`, an opening backtick, or
+3. a `<` with no `>` and no whitespace after it, or
+4. **an open code block or code span anywhere in the turn**, or
+5. **an open thinking block** — the most recent think tag in the generated ids is the *open* id.
+
+Rules 1–3 are deliberately local. Global quote parity was tried; one lone quote several hundred
+characters back kept the guard intervening forever. Rule 4 cannot be local — a code block is longer
+than any tail — and it cannot be windowed either. Rule 5 is id-based, so it cannot fire on quoted
+text.
+
+**The window bug, because it is the instructive one.** The span check used to be handed the last 64
+token ids of everything generated. Two failures followed, both measured: a window that starts
+*inside* a code block reads that block's closing fence as an opening one, so a complete answer looks
+truncated (`keep=64` said truncated; `keep=128`, `256` and the full length all said complete); and
+the reasoning block is prose *about* code — stray backticks, nested quoting — whose parity says
+nothing about whether the answer is finished. `Guard.answer_text()` now decodes **only the answer**:
+everything after the most recent think-close id, with no cap. Parity is only meaningful over a whole
+turn, which is also why `--control-span-scan` defaults to `0`.
+
+### Why the escape, and not the token
+
+The model stopped early because the turn-end token is a string it can type — so the guard cannot
+push it back through the door it came in through. It appends the **escaped spelling**: `<` + U+200B +
+`|im_end|>`, a sequence of ordinary characters that cannot re-tokenise into the reserved id. The
+model reads it as "you wrote the tag as text" — a hint, not a stop. The same escaping is already
+used for control tokens in the prompt, so the convention is not new to it.
+
+### The same principle, applied to the thinking block
+
+`think_split.py` patches two server internals — `Detokenizer.push` records the id just decoded,
+`OutputParser.feed` notices a reasoning→content transition — and reports which id completed the
+marker:
+
+```
+[think-split] reasoning -> content by id 248069: RESERVED id -> the model really closed its thinking
+[think-split] reasoning -> content by id 2: SPELLED out of ordinary tokens -> a quoted marker
+```
+
+In `strict`, the second branch is undone: the parser's state goes back to reasoning, the `content`
+events from that batch are rewritten as `reasoning`, and the quoted marker is re-inserted in the
+escaped spelling so a downstream splitter that matches raw tag text does not read it as a real close.
+
+Two deliberate no-ops, so it can only ever fail safe:
+
+- if the split released `tool_call` events it is left alone — those cannot be un-emitted;
+- if the pack has **no** reserved id for the marker, every close is spelled and a spelled close
+  carries no information, so nothing is rewritten.
+
+### What it does not do
+
+- It only sees stops caused by the **turn-end token**. A reply ended by an OpenAI `stop` string, a
+  degenerate-repeat stop, or the engine's loop recovery is a different code path.
+- It does not touch `max_tokens` truncation. Hitting the token budget is not a control-span stop,
+  and rescuing it would be wrong.
+- It cannot know whether the model *meant* to stop inside a quote. If it did, the guard spends up to
+  N extra engine calls and appends the escape. That is the cost, bounded by `--control-span-rescues`.
+- It changes the answer text by the escape sequence. To keep the artefact to one occurrence use
+  `--control-span-rescues 1`; to hide it entirely, filter `<` + U+200B + `|im_end|>` client-side.
+
+## 5. Tests
 
 ```bash
-python3 ab_guard.py HOST_WITHOUT:8086 HOST_WITH:8085 "$API_KEY"
-```
-
-```
-CASE: unclosed fenced code block
-  without guard: finish=stop  rescues=0  '```python\nprint("hi")'
-  with    guard: finish=stop  rescues=2  '```python\nprint("hi")<\u200b|im_end|><\u200b|im_end|>'
-  -> DIFFERS  as expected
-...
-6 of 6 cases behaved as expected.
-```
-
-It prints answers with `repr()` on purpose. The escape contains U+200B, a zero-width space:
-invisible in a terminal, in a browser, and in a diff. Comparing two answers by eye or with
-`diff` is the most common way to conclude there is no difference when there is one. Two other
-ways to miss it: send the prompts with **real newlines** (the escaped `\n` in this README is
-notation, not what to type), and drive the **API** rather than the chat UI - the UI runs with
-thinking enabled, which changes what the model writes and often lets it close its own code
-block, so neither server truncates and there is nothing to see.
-
-## Tests
-
-```bash
-python3 test_control_span.py            # 25 predicate cases, no GPU or engine needed
+python3 test_control_span.py             # predicate cases, no GPU or engine needed (runs in CI)
+python3 test_think_split.py              # reserved-id vs spelled-marker, log and strict, offline
 STRATA_ROOT=/path/to/strata python3 test_integration.py
 STRATA_ROOT=/path/to/strata python3 test_real_engine_shape.py
 STRATA_ROOT=/path/to/strata python3 test_server_consumer_shape.py
 ```
 
-The last one matters most. A guard on a generator is only as alive as its consumer, so these
-tests drive it the way the real server does - breaking at the first turn-end id, and emitting
-`None` heartbeats while idle. A test that runs the generator to exhaustion proves the logic and
-nothing about production.
+The last one matters most. A guard on a generator is only as alive as its consumer, so those tests
+drive it the way the real server does — breaking at the first turn-end id, emitting `None` heartbeats
+while idle. Running a generator to exhaustion proves the logic and nothing about production. The first
+two need nothing but Python; the rest need a real Strata install and its tokenizer, which is what
+makes them exercise the engine's actual output shape rather than a convenient one.
 
-The first file needs nothing but Python and runs on every push in CI. The other three need a
-real Strata install and its tokenizer, which is what makes them worth having: they exercise the
-guard against the engine's actual output shape, not a convenient one.
-
-## Contributing
-
-The two things that move this project forward are more measured pairs like the ones above -
-a prompt, the output without the guard, the output with it - and test cases for the predicate.
-If you hit a reply that the guard should have rescued and did not, or one it rescued and
-should not have, open an issue with the prompt and both outputs: that is the whole bug report.
-
-Settings worth experimenting with are `--control-span-rescues` and `--control-span-window`.
-The defaults were chosen on one model on one machine; they are very likely not right for every
-model, and a predicate tuned for a model that writes a lot of prose will misjudge one that
-writes a lot of code.
-
-## Files
+## 6. Files
 
 | file | |
 |---|---|
-| `serve_with_guard.py` | drop-in replacement for `serve/server.py`; installs the guard |
-| `control_span.py` | the guard and the predicate |
+| `serve_with_guard.py` | drop-in replacement for `serve/server.py`; installs both guards |
+| `control_span.py` | the control-span guard and its predicate |
+| `think_split.py` | the think-split guard: which id closed the thinking block, and what to do |
 | `stats_from_log.py` | optional: reads the engine's own log to fill in usage stats |
-| `probe_guard.py` | live A/B probe against a running server |
-| `ab_guard.py` | the same prompts against two servers, with a verdict per case |
-| `test_*.py` | unit and engine-shaped tests |
+| `probe_guard.py` | live probe against one running server |
+| `ab_guard.py` | the same prompts against two servers, verdict per case |
+| `probe_think_split.py` | provoke a quoted marker and show what was logged |
+| `test_*.py` | offline, engine-shaped and consumer-shaped tests |
 | `SPEC.md` | the design, decision table and the reasoning behind each rule |
+
+## 7. Contributing
+
+The two things that move this forward are more measured pairs — a prompt, the output without the
+guard, the output with it — and test cases for the predicate. If the guard should have rescued a
+reply and did not, or rescued one it should not have, open an issue with the prompt and both outputs:
+that is the whole bug report.
+
+The defaults were chosen on one model on one machine and are very likely wrong for yours.
+`--control-span-rescues`, `--control-span-window` and `STRATA_THINK_SPLIT` are the settings worth
+tuning; a predicate tuned for a model that writes prose will misjudge one that writes code.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
