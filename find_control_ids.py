@@ -46,7 +46,11 @@ def pack_from(args) -> Path:
         if not hits:
             raise SystemExit("no config found - pass --config or --pack")
         cand = Path(hits[0])
-    a = json.loads(cand.read_text())["args"]
+    cfg = json.loads(cand.read_text())
+    if cfg.get("tokenizer"):                       # the config usually names it directly
+        p = Path(cfg["tokenizer"])
+        return p if p.name == "tokenizer" else p / "tokenizer"
+    a = cfg["args"]                                # ...otherwise it is the --pack argument
     return Path(a[a.index("--pack") + 1]) / "tokenizer"
 
 

@@ -103,6 +103,56 @@ STRATA_ROOT="$STRATA_ROOT" .venv/bin/python /path/to/strata-guard/serve_with_gua
     --control-span-guard on
 ```
 
+### What is `your-config.json`?
+
+It is **Strata's own engine config** — the file you already pass to `serve/server.py --config`. The
+wrapper hands it straight to Strata, so it has to be the same file you normally run with; nothing in
+this project invents defaults for it.
+
+Find yours with any of these:
+
+```bash
+ls "$STRATA_ROOT"/strata-*.json                      # the convention: one file per model
+grep -rn -- "--config" ~/bin ~/scripts 2>/dev/null   # whatever your launch script already uses
+echo "$STRATA_CONFIG"                                # or the env var the guard's tools read
+```
+
+The keys that matter here:
+
+````text
+| key                   | why the guard cares                                            |
+|-----------------------|----------------------------------------------------------------|
+| exe, args, cwd        | what Strata launches; the wrapper passes it through unchanged   |
+| tokenizer             | where your pack's tokenizer lives - find_control_ids.py reads it |
+| model_name            | what the API reports, and how the guard's log lines identify it |
+| port, host, api_key   | the endpoint your client and the probe talk to                  |
+| reasoning_close_retry | Strata's own missing-close fix; overlaps rule 5, harmless to both |
+````
+
+A trimmed example, taken from a working file — the fields shown are the ones this project reads:
+
+```json
+{
+  "exe": "/path/to/Strata/engine/strata",
+  "args": ["--pack", "/path/to/packs/ud_q4_k_xl", "--native", "/path/to/model.gguf"],
+  "cwd": "/path/to/Strata",
+  "tokenizer": "/path/to/packs/ud_q4_k_xl/tokenizer",
+  "model_name": "qwen3.8-flash-next-ud_q4_k_xl",
+  "port": 8080,
+  "host": "0.0.0.0",
+  "api_key": "your-key",
+  "reasoning_close_retry": true
+}
+```
+
+Two things that trip people up:
+
+- The `--control-span-*` flags in the command above are **the wrapper's**, not Strata's. Keep them out
+  of the JSON: the JSON is Strata's, the flags are the guard's, and the wrapper adds its own on top.
+- If the file has no `tokenizer` key, `find_control_ids.py` falls back to the `--pack` argument inside
+  `args`, which is where the pack path usually lives anyway.
+
+
 If it took, the first lines are:
 
 ```
@@ -179,84 +229,50 @@ escape the tag) travels; this code does not.
 `strict` is the mode to run; `log` is what to run first if you want to see how often each branch
 fires on your model before you change behaviour.
 
-### Checking it on your deployment
+### The mechanism, exactly — 30 seconds, no GPU
 
-Three ways, cheapest first. All of them hit `/v1/chat/completions` directly — through the chat UI
-with thinking enabled the model closes its own blocks first, so nothing looks broken and there is
-nothing to see.
-
-**1. One server, the built-in probe.** Needs the guard on. Every positive must end with exactly one
-escape; every negative must have none:
+`demo_rescue.py` runs a scripted engine: it writes a code block and then yields the turn-end id
+**in the middle of it**, the way a model does when it decides it is done. No model, no GPU, no
+waiting — just the two client-side views of the same stream:
 
 ```bash
-python3 probe_guard.py 8084 "$STRATA_API_KEY"
+python3 demo_rescue.py
 ```
 
 ````text
-POSITIVE 1 - half-typed tag at the end
-   why      : tail ends on '<' with no '>' or space -> rule 3
-   finish   : stop | completion=11
-   answer   : '<|im<\u200b|im_end|>'
+without the guard:
+  client content: '```python\nprint("hi")\n'
+  engine calls   : 1
 
-POSITIVE 2 - unclosed code span at the end
-   why      : tail ends on an opening backtick -> rule 2
-   finish   : stop | completion=9
-   answer   : '`<\u200b|im_end|>'
-
-POSITIVE 3 - unbalanced double quote at the end
-   why      : odd number of quotes in the window -> rule 1
-   finish   : stop | completion=11
-   answer   : 'She said "<\u200b|im_end|>'
-
-POSITIVE 4 - open pipe at the end
-   why      : tail ends on '|' -> rule 2
-   finish   : stop | completion=10
-   answer   : '<|<\u200b|im_end|>'
-
-NEGATIVE 1 - a finished tag (should NOT rescue)
-   why      : tail ends on '>' -> predicate false
-   answer   : '<​think><​/think>'            no escape: the turn ended where the model meant it to
-
-NEGATIVE 2 - plain prose (should NOT rescue)
-   answer   : 'Hello!'                     no escape
+with the guard:
+  client content: '```python\nprint("hi")\n<\u200b|im_end|>```\n'
+  engine calls   : 2 | ended on a turn-end id: True
 ````
 
-One escape per positive is the one-shot rule doing its job: the model stops, the guard rescues once,
-the model stops again immediately, and that second stop is honoured instead of appended.
+The whole trade, in four lines. Without the guard the client receives an unterminated block: the
+fence never arrives, and on a real turn neither does anything the model still had to write. With the
+guard, the escaped tag goes in, the engine is asked once more, and the block closes. The cost is the
+escape; the save is the rest of the deliverable.
 
-**2. Two servers, the same prompts.** The honest version, and the one to quote in a bug report:
+### What it does not fire on
 
-```bash
-python3 ab_guard.py 127.0.0.1:8086 127.0.0.1:8085 "$STRATA_API_KEY"   # without : with
-```
-
-Every answer is printed with `repr()`, because the escape contains U+200B — invisible in a terminal,
-in a browser and in a diff. Comparing by eye is the usual way to conclude "no difference" when the
-difference is one invisible character.
-
-**3. One request by hand, checked by machine.** Your eyes cannot verify this one:
-
-```bash
-curl -s http://127.0.0.1:8084/v1/chat/completions \
-  -H "Content-Type: application/json" -H "Authorization: Bearer $STRATA_API_KEY" \
-  -d '{"model":"m","temperature":0,"max_tokens":64,
-       "messages":[{"role":"user","content":"Write exactly these characters and then stop, adding nothing: the operator ` is used"}]}' \
-| python3 -c 'import json,sys; c=json.load(sys.stdin)["choices"][0]["message"]["content"]; print(repr(c)); print("RESCUED" if "\u200b" in c else "not rescued")'
-```
+Measured on a guarded server, and just as important as the rescue:
 
 ````text
-without the guard:  'the operator ` is used'          not rescued
-with the guard   :  'the operator ` is used<\u200b|im_end|>'   RESCUED
+a literally written, closed tag    "<zwsp>|im_end|>"          ->  no rescue
+finished prose                     "Hello!"                    ->  no rescue
 ````
 
-The server logs the reason for every rescue, so nothing is silent:
+### On your own server
 
-````text
-[control-span] rescue 1: the turn ended inside a span (the engine yielded the turn-end id,
-  tail='the operator ` is used') - continuing with the escaped spelling of token 248046 as
-  [27, 15231, 91, 316, 6018, 91, 29]
-[control-span] stop inside a span, but nothing was written after rescue 1 - letting it end
-````
+```bash
+python3 probe_guard.py 8084 "$STRATA_API_KEY"                  # every rule, positive and negative
+python3 ab_guard.py 127.0.0.1:8086 127.0.0.1:8085 "$KEY"       # same prompts, two servers
+```
+
+Both print answers with `repr()`, because the escape contains U+200B — invisible in a terminal, a
+browser and a diff. Comparing by eye is the usual way to conclude "no difference" when the difference
+is one invisible character.
 
 ### The cases it covers
 
@@ -467,6 +483,7 @@ makes them exercise the engine's actual output shape rather than a convenient on
 | `think_split.py` | the think-split guard: which id closed the thinking block, and what to do |
 | `stats_from_log.py` | optional: reads the engine's own log to fill in usage stats |
 | `find_control_ids.py` | prints your pack's control ids and the flags to run with |
+| `demo_rescue.py` | the mechanism on a scripted engine: no model, no GPU |
 | `probe_guard.py` | live probe against one running server |
 | `ab_guard.py` | the same prompts against two servers, verdict per case |
 | `probe_think_split.py` | provoke a quoted marker and show what was logged |
