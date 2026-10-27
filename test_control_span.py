@@ -3,14 +3,15 @@ F3 = chr(96) * 3
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from control_span import inside_span, escape_text, ZWSP
+from control_span import (inside_span, escape_text, ZWSP,
+                         ALL_RULES, DEFAULT_RULES, parse_rules)
 
 CASES = [
     # (tail, expected, label)   -- ported from the llama.cpp predicate test set
     ('The answer is `', True, "open backtick after a space"),
     ('write it as `<', True, "mid-tag: '<' with nothing after it"),
     ('write it as `<|im_', True, "half-typed tag"),
-    ('say "hello', True, "unbalanced double quote"),
+    ('say "hello', False, "unbalanced double quote: rule 1 is OFF by default"),
     ('The answer is 4.', False, "plain prose"),
     ('see `<\\u200b/think>`, then continue', False, "escaped tag inside a closed span"),
     ('`<'+'think> and <'+'think>`', False, "closed span, finished tag"),
@@ -52,6 +53,34 @@ WINDOWED = [
     (CLOSED + "\n\n" + F3 + "bash\nls", 0, True, "a block genuinely left open at the end"),
 ]
 
+
+# --- rule 1, on demand: what it catches, and the false positive that leaked ----
+RULE1_ON = [
+    ('say "hello', True, "rule 1 ON: mid-quote stop is caught"),
+    # the real 2026-10-27 leak: the quote CLOSES 24 chars before the end, but the 32-char
+    # window opens between the opener and the closer, so the slice reads odd
+    ('the log is clean. Say "check the build" and I\'ll read the log.',
+     True, "rule 1 ON: the false positive on a FINISHED answer (the leak)"),
+    ('the log is clean. Say "check the build" and I\'ll read the log.',
+     False, "rule 1 OFF (default): the same finished answer is left alone"),
+]
+
+# --- the rule selector itself --------------------------------------------------
+CFG = [
+    (None, DEFAULT_RULES, "unset -> the default (rule 1 off)"),
+    ("", DEFAULT_RULES, "empty -> the default"),
+    ("all", ALL_RULES, "all four"),
+    ("none", (), "none: the guard never rescues on a span, only on an open think block"),
+    ("1", (1,), "one id"),
+    ("quote,code", (1, 4), "by name"),
+    ("all,-1", DEFAULT_RULES, "all minus rule 1 == the default"),
+    ("-1", DEFAULT_RULES, "a bare subtraction starts from the default"),
+    ("2, 3,4", (2, 3, 4), "spaces tolerated"),
+]
+
+BAD_CFG = [("9", "rule id 9 does not exist"), ("quoe", "a misspelt name must raise")]
+
+
 def run():
     bad = 0
     for tail, want, label in CASES:
@@ -69,9 +98,27 @@ def run():
         ok = got == want
         bad += 0 if ok else 1
         print(f"  {'PASS' if ok else 'FAIL'}  want={want!s:5s} got={got!s:5s}  {label}")
+    for text, want, label in RULE1_ON:
+        got = inside_span(text, rules=ALL_RULES if "ON:" in label and "OFF" not in label else DEFAULT_RULES)
+        ok = got == want
+        bad += 0 if ok else 1
+        print(f"  {'PASS' if ok else 'FAIL'}  want={want!s:5s} got={got!s:5s}  {label}")
+    for spec, want, label in CFG:
+        got = parse_rules(spec)
+        ok = got == want
+        bad += 0 if ok else 1
+        print(f"  {'PASS' if ok else 'FAIL'}  want={want!s:12s} got={got!s:12s}  {label}")
+    for spec, label in BAD_CFG:
+        try:
+            parse_rules(spec)
+            bad += 1
+            print(f"  FAIL  no error for {spec!r}  ({label})")
+        except ValueError:
+            print(f"  PASS  rejects {spec!r}  ({label})")
     assert escape_text("</think>") == "<" + ZWSP + "/think>", escape_text("</think>")
     print(f"  PASS  escape_text inserts U+200B after the first character")
-    print(f"\n  {len(CASES)+len(PARITY)+len(WINDOWED)+1} cases, {bad} failures")
+    n = len(CASES) + len(PARITY) + len(WINDOWED) + len(RULE1_ON) + len(CFG) + len(BAD_CFG) + 1
+    print(f"\n  {n} cases, {bad} failures")
     return 1 if bad else 0
 
 if __name__ == "__main__":

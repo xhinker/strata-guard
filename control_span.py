@@ -39,6 +39,66 @@ _WHITESPACE = " \t\r\n\f\v"
 # rule 2: a backtick counts as OPENING when the character before it is one of these
 _OPENERS = (" ", "\t", "\n", "(", "[", ":", ",", "-", "=", ";")
 
+# --------------------------------------------------------------------------------------
+# The predicate is FOUR rules, and they are not equally trustworthy, so each one is
+# addressable by id (and by name).  --control-span-rules / STRATA_CONTROL_SPAN_RULES picks
+# which run; DEFAULT_RULES leaves rule 1 OFF (see _rule_quote for why).
+# --------------------------------------------------------------------------------------
+RULE_QUOTE, RULE_DANGLING, RULE_HALF_TAG, RULE_CODE = 1, 2, 3, 4
+ALL_RULES = (RULE_QUOTE, RULE_DANGLING, RULE_HALF_TAG, RULE_CODE)
+DEFAULT_RULES = (RULE_DANGLING, RULE_HALF_TAG, RULE_CODE)      # rule 1 off by default
+
+RULE_NAMES = {RULE_QUOTE: "quote", RULE_DANGLING: "dangling", RULE_HALF_TAG: "half-tag",
+              RULE_CODE: "code"}
+
+
+def rule_name(rule_id):
+    return RULE_NAMES.get(int(rule_id), str(rule_id))
+
+
+def parse_rules(spec, default=DEFAULT_RULES):
+    """Turn a config value into a sorted tuple of rule ids.
+
+    Accepts ids ("2,3,4"), names ("dangling,half-tag,code"), the words "all" and "none", and
+    a "-" prefix to subtract from the default ("all,-1", or just "-1").  None or "" means the
+    default.  An unknown token raises, so a typo in a config file fails loudly at start
+    instead of quietly running a different predicate.
+    """
+    if spec is None:
+        return tuple(default)
+    if not isinstance(spec, str):
+        spec = ",".join(str(x) for x in spec)   # a tuple/list/set of ids, straight from code
+    toks = [t.strip().lower() for t in str(spec).replace(" ", ",").split(",") if t.strip()]
+    if not toks:
+        return tuple(default)
+    by_name = {v: k for k, v in RULE_NAMES.items()}
+    out, subtract = set(), set()
+    for t in toks:
+        neg = t.startswith("-")
+        t2 = t[1:].strip() if neg else t
+        if t2 in ("all", "*"):
+            base = set(ALL_RULES)
+        elif t2 in ("none", "off"):
+            base = set()
+        elif t2.isdigit():
+            rid = int(t2)
+            if rid not in RULE_NAMES:
+                raise ValueError("unknown control-span rule id %r (valid: 1-4, all, none)" % t2)
+            base = {rid}
+        elif t2 in by_name:
+            base = {by_name[t2]}
+        else:
+            raise ValueError("unknown control-span rule %r (valid: 1-4, %s, all, none)"
+                             % (t2, ", ".join(sorted(by_name))))
+        (subtract if neg else out).update(base)
+    if not out and subtract:
+        out = set(default)          # a bare "-1" means "the default, minus rule 1"
+    return tuple(sorted(out - subtract))
+
+
+def _fmt_rules(rules):
+    return "[" + ",".join("%d:%s" % (r, rule_name(r)) for r in sorted(rules)) + "]"
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -93,50 +153,93 @@ def _open_code_span(text: str) -> bool:
     return fence is not None or inline
 
 
-def inside_span(text: str, window: int = 32, scan: int | None = None) -> bool:
-    """True when the model looks cut off inside a quote, a code span or a code block.
+def _rule_quote(tail):
+    """Rule 1 - an odd number of double quotes in the tail.  OFF by default.
 
-    `text` is the recent generated text (up to `scan` characters).  Rules 1-3 stay deliberately
-    local - they look at the last `window` characters only, because global quote parity was
-    "too sticky": one lone quote far back kept the guard blocking forever.  Rule 4 cannot be
-    local: a fenced block is longer than any tail, so it reads the whole `scan` window.
+    This is the rule that leaked a control tag into a finished answer (2026-10-27), and the
+    fault is structural, not a wrong window size.  Quote parity is a property of a WHOLE
+    sequence: with s(i) = parity over text[0..i], the target is s(n) == 1, but a slice
+    computes s(n) XOR s(n-window).  The two agree only when s(n-window) == 0 - when the
+    window boundary happens to fall outside any quote - and the boundary state is exactly
+    what the slice throws away.  Measured on the real case: opener 4645, closer 4661, window
+    opened at 4653, so the window held the closer but not the opener: odd, so "inside a
+    quote", while the turn (6 quotes) was closed.  Widen the window and the error just moves.
+
+    It fails the other way too: a quote opened before the window plus two quotes inside it
+    reads even, so a genuine mid-quote stop goes unrescued.
+
+    Whole-turn parity is the correct STATE but the wrong INFERENCE - prose is not a
+    well-formed depth-1 bracket language (quotes inside code spans, JSON, tables), and one
+    lone quote 4,000 characters back keeps the guard blocking forever ("too sticky").  A
+    truncation risk depends on the state AND the distance since the opener; neither rule as
+    written carries the second term.  Re-enable with --control-span-rules all for the
+    llama.cpp predicate 1:1.
     """
-    tail = text[-window:]
-    # (1) odd number of double quotes INSIDE the window only (global parity was
-    #     "too sticky": one lone quote far back kept the guard blocking forever)
-    if tail.count('"') % 2 == 1:
-        return True
+    return tail.count('"') % 2 == 1
 
-    # (2) the tail ends on '|' or on an opening backtick (trailing whitespace ignored;
-    #     '>' is deliberately NOT an opener - "`<|im_end|>`" is a legitimate ending)
+
+def _rule_dangling(tail):
+    """Rule 2 - the tail ends on '|' or on an opening backtick (trailing whitespace ignored).
+
+    '>' is deliberately NOT an opener: a quoted, escaped turn-end tag is a legitimate ending.
+    Genuinely local - the evidence is an unfinished token, so it sits in the last characters.
+    """
     n = len(tail)
     while n > 0 and tail[n - 1] in _WHITESPACE:
         n -= 1
-    if n > 0:
-        last = tail[n - 1]
-        if last == "|":
-            return True
-        if last == "`":
-            prev = tail[n - 2] if n >= 2 else " "
-            if prev in _OPENERS:
-                return True
+    if n == 0:
+        return False
+    last = tail[n - 1]
+    if last == "|":
+        return True
+    if last == "`":
+        prev = tail[n - 2] if n >= 2 else " "
+        return prev in _OPENERS
+    return False
 
-    # (3) mid-tag: a '<' with no '>' and no whitespace after it
+
+def _rule_half_tag(tail):
+    """Rule 3 - a '<' with no '>' and no whitespace after it: the model is mid-tag.
+
+    Also genuinely local: a half-typed tag cannot be longer than the window.
+    """
     lt = tail.rfind("<")
-    if lt != -1:
-        rest = tail[lt + 1:]
-        if ">" not in rest and not any(c in _WHITESPACE for c in rest):
-            return True
+    if lt == -1:
+        return False
+    rest = tail[lt + 1:]
+    return ">" not in rest and not any(c in _WHITESPACE for c in rest)
 
-    # (4) an OPEN code block or code span - the case a tail-local rule cannot see: the model
-    #     stopped inside a fenced block, or after an inline span it opened earlier and left open.
-    #
-    # This one cannot be windowed.  A window that starts INSIDE a code block sees that block's
-    # closing fence as an opening one, and reports a perfectly closed answer as an open span
-    # (measured: the last 200 characters of a complete FastAPI answer return True).  Parity is
-    # only meaningful over the whole turn, so `scan` defaults to 0 = no limit; a positive value
-    # caps the work for very long outputs and accepts that artifact.
-    if _open_code_span(text if not scan else text[-scan:]):
+
+def _rule_set(rules):
+    """Normalise ids, names or a config string to a set of rule ids."""
+    return set(parse_rules(rules))
+
+
+def inside_span(text: str, window: int = 32, scan: int | None = None, rules=None) -> bool:
+    """True when the model looks cut off inside a quote, a code span or a code block.
+
+    `text` is the recent generated text (up to `scan` characters).  Rules 2 and 3 stay
+    deliberately local - they look at the last `window` characters only, because they detect
+    unfinished TOKENS and that evidence cannot be far from the end.  Rule 4 cannot be local:
+    a fenced block is longer than any tail, so it reads the whole `scan` window.  Rule 1 is
+    neither: it is a nesting STATE, its evidence can be arbitrarily far back, and a slice of
+    it is meaningless - which is why it is off by default (see _rule_quote).
+
+    `rules` selects which run: ids/names, a config string, or None for DEFAULT_RULES.
+    """
+    rules = DEFAULT_RULES if rules is None else _rule_set(rules)
+    tail = text[-window:]
+    if RULE_QUOTE in rules and _rule_quote(tail):
+        return True
+    if RULE_DANGLING in rules and _rule_dangling(tail):
+        return True
+    if RULE_HALF_TAG in rules and _rule_half_tag(tail):
+        return True
+    # Rule 4: an OPEN code block or code span - the case a tail-local predicate cannot see:
+    # the model stopped inside a fenced block, or after an inline span it opened earlier and
+    # left open.  Parity is only meaningful over the whole turn, so `scan` defaults to 0 = no
+    # limit; a positive value caps the work for very long outputs and accepts that artifact.
+    if RULE_CODE in rules and _open_code_span(text if not scan else text[-scan:]):
         return True
 
     return False
@@ -153,7 +256,7 @@ class Guard:
     CONTROL_TYPE = 3          # token_type.json: 3 = CONTROL (<|im_start|>, <|im_end|>, <|endoftext|>)
 
     def __init__(self, tok, eos_ids, types=None, window=32, max_rescues=5, log=sys.stderr,
-                 scan=0, think_ids=None):
+                 scan=0, think_ids=None, rules=None):
         self.tok, self.eos_ids, self.types = tok, set(eos_ids), types
         self.scan = max(0, scan)          # 0 = the whole turn (see inside_span rule 4)
         # the token to spell out when the stream itself carried no eos (the resident engine returns on
@@ -161,6 +264,7 @@ class Guard:
         ordered = [int(x) for x in eos_ids]
         self.turn_id = ordered[-1] if ordered else 248046
         self.window, self.max_rescues, self.log = window, max_rescues, log
+        self.rules = parse_rules(rules)          # None -> DEFAULT_RULES (rule 1 off)
         # the thinking-block markers (USER_DEFINED tokens, so they appear in the stream as real ids):
         # a stop while the most recent of the two is the OPEN tag is a truncation, not an end of turn.
         t = tuple(int(x) for x in (think_ids or DEFAULT_THINK))
@@ -283,7 +387,8 @@ class Guard:
             # (b): the stream ended by itself, so a stop short of the cap is an end-of-turn.
             ended_by_stream = stop_id is None and len(produced) + 1 < max_new
             stopping = stop_id is not None or ended_by_stream
-            span = inside_span(recent, window=self.window, scan=self.scan)
+            span = inside_span(recent, window=self.window, scan=self.scan,
+                                 rules=self.rules)
             thinking = self._thinking_open(ids + produced)
             if not (stopping and (span or thinking)):
                 if stop_id is not None:
@@ -341,7 +446,8 @@ def install(server_module, tok, types=None, eos_ids=None, force=False):
                   window=_env_int("STRATA_CONTROL_SPAN_WINDOW", 32),
                   max_rescues=_env_int("STRATA_CONTROL_SPAN_RESCUES", 5),
                   scan=_env_int("STRATA_CONTROL_SPAN_SCAN", 0),
-                  think_ids=think)
+                  think_ids=think,
+                  rules=parse_rules(os.environ.get("STRATA_CONTROL_SPAN_RULES")))
     cls = server_module.StrataEngine
     original = cls.generate
 
@@ -353,6 +459,7 @@ def install(server_module, tok, types=None, eos_ids=None, force=False):
             return original(self, ids, max_new, sampling, cancel, embeddings)
 
     cls.generate = generate
-    guard._note("ENABLED (eos ids %s, think ids %s, window %d, max rescues %d)",
-                sorted(eos), sorted(think), guard.window, guard.max_rescues)
+    guard._note("ENABLED (eos ids %s, think ids %s, window %d, max rescues %d, rules %s)",
+                sorted(eos), sorted(think), guard.window, guard.max_rescues,
+                _fmt_rules(guard.rules))
     return guard

@@ -15,6 +15,7 @@ No upstream file is modified; the patch exists only for this process.
     --control-span-scan N           characters scanned for an open code span/block (0 = the whole turn)
     --control-span-eos IDS          turn-end token ids, comma separated (Qwen: 248044,248046)
     --control-span-think IDS        think open/close token ids (Qwen: 248068,248069)
+    --control-span-rules SPEC       which predicate rules run (default 2,3,4: rule 1 is off)
 """
 
 from __future__ import annotations
@@ -104,6 +105,7 @@ def main() -> int:
     argv, scan = _take_flag(argv, "--control-span-scan", int, None)
     argv, eos = _take_flag(argv, "--control-span-eos", str, None)
     argv, think = _take_flag(argv, "--control-span-think", str, None)
+    argv, rules = _take_flag(argv, "--control-span-rules", str, None)
     if guard_flag is not None:
         os.environ["STRATA_CONTROL_SPAN_GUARD"] = guard_flag
     if window is not None:
@@ -116,6 +118,13 @@ def main() -> int:
         os.environ["STRATA_CONTROL_SPAN_EOS"] = eos
     if think is not None:                    # comma-separated think open/close ids, e.g. "248068,248069"
         os.environ["STRATA_CONTROL_SPAN_THINK"] = think
+    if rules is not None:                    # e.g. "all", "none", "2,3,4", "all,-1" (rule 1 off)
+        os.environ["STRATA_CONTROL_SPAN_RULES"] = rules
+        try:
+            control_span.parse_rules(rules)      # fail at start, not mid-request
+        except ValueError as exc:
+            print("[control-span] " + str(exc), file=sys.stderr)
+            return 2
 
     # the pack path: from --pack on the command line, else the model config's args
     pack = None

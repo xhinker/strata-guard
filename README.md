@@ -219,15 +219,95 @@ escape the tag) travels; this code does not.
 | flag | environment variable | default | meaning |
 |---|---|---|---|
 | `--control-span-guard on\|off` | `STRATA_CONTROL_SPAN_GUARD` | `off` | enable the control-span guard |
-| `--control-span-window N` | `STRATA_CONTROL_SPAN_WINDOW` | `32` | characters inspected at the end of the reply (rules 1–3) |
+| `--control-span-window N` | `STRATA_CONTROL_SPAN_WINDOW` | `32` | characters inspected at the end of the reply (rules 2–3, and rule 1 when it is enabled) |
 | `--control-span-rescues N` | `STRATA_CONTROL_SPAN_RESCUES` | `5` | hard bound on rescues per request (the one-shot rule usually stops at one) |
 | `--control-span-scan N` | `STRATA_CONTROL_SPAN_SCAN` | `0` | characters scanned for an open code span/block; `0` = the whole turn |
 | `--control-span-eos IDS` | `STRATA_CONTROL_SPAN_EOS` | `248044,248046` | turn-end token ids (Qwen3 / 3.5 / 3.8) |
 | `--control-span-think IDS` | `STRATA_CONTROL_SPAN_THINK` | `248068,248069` | think open/close token ids |
+| `--control-span-rules SPEC` | `STRATA_CONTROL_SPAN_RULES` | `2,3,4` | which predicate rules run — ids or names, `all`, `none`, or `-N` to subtract from the default (see below) |
 | | `STRATA_THINK_SPLIT=strict\|log\|off` | `off` | `strict` undoes a quoted-marker split; `log` only records which id closed the block; `off` installs nothing |
 
 `strict` is the mode to run; `log` is what to run first if you want to see how often each branch
 fires on your model before you change behaviour.
+
+### Which rules run — and why rule 1 is off by default
+
+The predicate is four rules, and they are addressable individually:
+
+| id | name | what it looks for | locality | default |
+|---|---|---|---|---|
+| 1 | `quote` | an odd number of `"` in the last `window` characters | **not local** — a nesting state | **off** |
+| 2 | `dangling` | the reply ends on `\|` or on an opening backtick | local (an unfinished token) | on |
+| 3 | `half-tag` | a `<` with no `>` and no space after it | local (an unfinished token) | on |
+| 4 | `code` | a fenced block or inline span left open | whole turn (`--control-span-scan`) | on |
+
+`--control-span-rules all` restores the llama.cpp predicate 1:1; `none` leaves the guard doing only
+the thinking-block check. A bad name or id fails at start rather than running a different predicate.
+
+**Why 1 is off.** Quote parity is a property of a whole sequence, not of a slice. With `s(i)` the
+parity over `text[0..i]`, the question the rule wants is `s(n) == 1`; the window computes
+`s(n) XOR s(n-window)`. Those agree only when the window boundary falls outside any quote, and the
+boundary state is exactly what the slice discards — so widening the window moves the error instead
+of removing it. Measured on the answer that leaked a control tag on 2026-10-27: opener at 4645,
+closer at 4661, window opened at 4653 — the window held the closer but not the opener, so it read
+odd and rescued a **finished** answer (6 quotes over the turn, closed), and the escape it injected
+reached the client. The rule also fails the other way: a quote opened before the window plus two
+quotes inside it reads even, so a real mid-quote stop goes unrescued.
+
+Whole-turn parity is the right *state* and the wrong *inference*: prose is not a depth-1 bracket
+language (quotes inside code spans, JSON, tables), and one lone quote 4,000 characters back keeps
+the guard blocking forever. A truncation risk depends on the state **and** the distance since the
+opener — neither rule as written carries the second term, which is why the honest default is to
+leave rule 1 out and rely on rules 2–4, which catch unfinished tokens and open blocks.
+
+### Choosing the rules — recipes for a plain Strata server
+
+Same launcher you already run; only the flag changes. Nothing here needs an engine restart beyond
+restarting the server process, and dropping the flag returns you to stock behaviour.
+
+```bash
+# the default: rules 2, 3 and 4 - unfinished tokens and open code blocks
+.venv/bin/python /path/to/strata-guard/serve_with_guard.py \
+    --engine strata --config your-config.json --port 8080 --control-span-guard on
+
+# the llama.cpp predicate exactly as it shipped before 2026-10-27 (rule 1 back in)
+    ... --control-span-guard on --control-span-rules all
+
+# thinking-block guard only: no span rescue at all
+    ... --control-span-guard on --control-span-rules none
+
+# one rule only - markdown-heavy workload, care about unclosed fences
+    ... --control-span-guard on --control-span-rules code
+
+# the default plus rule 1, by name
+    ... --control-span-guard on --control-span-rules 2,3,4,quote
+```
+
+The environment variable does the same thing for anyone who installs the guard into their own server
+instead of using the launcher, and it composes with a launcher that passes no rule flag:
+
+```bash
+STRATA_CONTROL_SPAN_RULES=all STRATA_CONTROL_SPAN_GUARD=on .venv/bin/python serve/server.py \
+    --engine strata --config your-config.json --port 8080
+```
+
+**What to pick.** Leave the default. Turn rule 1 back on only if you have evidence of truncations
+that end *inside a quote* and you accept that it also rescues finished answers that quote something —
+which is the artefact described above, not a hypothetical. `none` is for anyone who wants the guard to
+touch nothing but thinking blocks. A typo in the value stops the server at start:
+
+```
+[control-span] unknown control-span rule id '9' (valid: 1-4, all, none)
+```
+
+**Check what is actually armed** — the first line the guard prints names the rules, so a config file
+or a forgotten environment variable cannot silently change the predicate:
+
+```bash
+grep -a "control-span. ENABLED" your-engine.log
+# [control-span] ENABLED (eos ids [248044, 248046], think ids [248068, 248069],
+#                         window 32, max rescues 5, rules [2:dangling,3:half-tag,4:code])
+```
 
 ### The mechanism, exactly — 30 seconds, no GPU
 
@@ -279,7 +359,7 @@ is one invisible character.
 ````text
 | rule | the reply ends with                     | guard? | what you get                     |
 |------|-----------------------------------------|--------|----------------------------------|
-| R1   | an odd number of double quotes          | yes    | ...hello<\u200b|im_end|>         |
+| R1   | an odd number of double quotes          | opt-in | ...hello<\u200b|im_end|>  (`--control-span-rules all`) |
 | R2   | a trailing backtick or pipe             | yes    | ...used<\u200b|im_end|>          |
 | R3   | a half-typed tag: <|im, <|, <           | yes    | <|im<\u200b|im_end|>             |
 | R4   | an open code block or code span         | yes    | closed content + one escape      |
@@ -461,7 +541,7 @@ Two deliberate no-ops, so it can only ever fail safe:
 ## 5. Tests
 
 ```bash
-python3 test_control_span.py             # predicate cases, no GPU or engine needed (runs in CI)
+python3 test_control_span.py             # predicate + rule-selector cases, no GPU (runs in CI)
 python3 test_think_split.py              # reserved-id vs spelled-marker, log and strict, offline
 STRATA_ROOT=/path/to/strata python3 test_integration.py
 STRATA_ROOT=/path/to/strata python3 test_real_engine_shape.py
