@@ -224,90 +224,72 @@ escape the tag) travels; this code does not.
 | `--control-span-scan N` | `STRATA_CONTROL_SPAN_SCAN` | `0` | characters scanned for an open code span/block; `0` = the whole turn |
 | `--control-span-eos IDS` | `STRATA_CONTROL_SPAN_EOS` | `248044,248046` | turn-end token ids (Qwen3 / 3.5 / 3.8) |
 | `--control-span-think IDS` | `STRATA_CONTROL_SPAN_THINK` | `248068,248069` | think open/close token ids |
-| `--control-span-rules SPEC` | `STRATA_CONTROL_SPAN_RULES` | `2,3,4` | which predicate rules run — ids or names, `all`, `none`, or `-N` to subtract from the default (see below) |
+| `--control-span-rules SPEC` | `STRATA_CONTROL_SPAN_RULES` | `2,3,4` | which of the four checks run — by id or name, `all`, `none`, or `-N` to subtract (see below) |
 | | `STRATA_THINK_SPLIT=strict\|log\|off` | `off` | `strict` undoes a quoted-marker split; `log` only records which id closed the block; `off` installs nothing |
 
 `strict` is the mode to run; `log` is what to run first if you want to see how often each branch
 fires on your model before you change behaviour.
 
-### Which rules run — and why rule 1 is off by default
+### Which rules run, and why rule 1 is off by default
 
-The predicate is four rules, and they are addressable individually:
+The check for a cut-off reply is four rules. Each one can be switched on or off by itself:
 
-| id | name | what it looks for | locality | default |
-|---|---|---|---|---|
-| 1 | `quote` | an odd number of `"` in the last `window` characters | **not local** — a nesting state | **off** |
-| 2 | `dangling` | the reply ends on `\|` or on an opening backtick | local (an unfinished token) | on |
-| 3 | `half-tag` | a `<` with no `>` and no space after it | local (an unfinished token) | on |
-| 4 | `code` | a fenced block or inline span left open | whole turn (`--control-span-scan`) | on |
+| rule | name | fires when the reply ends… | default |
+|---|---|---|---|
+| 1 | `quote` | with a double quote that has no closing quote in the last 32 characters | **off** |
+| 2 | `dangling` | on a `\|` or an opening backtick — an unfinished token | on |
+| 3 | `half-tag` | on a `<` with nothing after it — a half-typed tag | on |
+| 4 | `code` | inside a code block or inline span that was never closed (searched over the whole reply) | on |
 
-`--control-span-rules all` restores the llama.cpp predicate 1:1; `none` leaves the guard doing only
-the thinking-block check. A bad name or id fails at start rather than running a different predicate.
+**Why rule 1 is off.** It counts quotes in the last 32 characters, but "is this quote closed?" is a
+question about the whole reply. When a quoted phrase straddles the edge of that window, the window
+sees the closing quote without the opening one and calls a finished reply cut off. A real case from
+2026-10-27: the reply was 4,685 characters with six quotes, all closed — but the window started at
+character 4,653, between the opening quote (4,645) and the closing one (4,661). The rule fired, the
+guard rescued a turn that had already ended, and the marker it injected landed in the user's answer.
 
-**Why 1 is off.** Quote parity is a property of a whole sequence, not of a slice. With `s(i)` the
-parity over `text[0..i]`, the question the rule wants is `s(n) == 1`; the window computes
-`s(n) XOR s(n-window)`. Those agree only when the window boundary falls outside any quote, and the
-boundary state is exactly what the slice discards — so widening the window moves the error instead
-of removing it. Measured on the answer that leaked a control tag on 2026-10-27: opener at 4645,
-closer at 4661, window opened at 4653 — the window held the closer but not the opener, so it read
-odd and rescued a **finished** answer (6 quotes over the turn, closed), and the escape it injected
-reached the client. The rule also fails the other way: a quote opened before the window plus two
-quotes inside it reads even, so a real mid-quote stop goes unrescued.
+The same rule also misses real cut-offs: a quote opened before the window plus two inside it counts
+as even. Counting over the whole reply doesn't fix it either — prose is full of quotes that quote
+nothing (inside code, JSON, tables), and one stray quote early in a long answer would keep the guard
+firing for the rest of the turn. Whether a stop is risky depends on how long ago the quote opened,
+and no version of this rule looks at that. Rules 2, 3 and 4 don't have the problem: an unfinished
+token or an unclosed block really is visible at the end.
 
-Whole-turn parity is the right *state* and the wrong *inference*: prose is not a depth-1 bracket
-language (quotes inside code spans, JSON, tables), and one lone quote 4,000 characters back keeps
-the guard blocking forever. A truncation risk depends on the state **and** the distance since the
-opener — neither rule as written carries the second term, which is why the honest default is to
-leave rule 1 out and rely on rules 2–4, which catch unfinished tokens and open blocks.
+### Choosing the rules
 
-### Choosing the rules — recipes for a plain Strata server
-
-Same launcher you already run; only the flag changes. Nothing here needs an engine restart beyond
-restarting the server process, and dropping the flag returns you to stock behaviour.
+One flag, added to the command you already run:
 
 ```bash
-# the default: rules 2, 3 and 4 - unfinished tokens and open code blocks
 .venv/bin/python /path/to/strata-guard/serve_with_guard.py \
-    --engine strata --config your-config.json --port 8080 --control-span-guard on
-
-# the llama.cpp predicate exactly as it shipped before 2026-10-27 (rule 1 back in)
-    ... --control-span-guard on --control-span-rules all
-
-# thinking-block guard only: no span rescue at all
-    ... --control-span-guard on --control-span-rules none
-
-# one rule only - markdown-heavy workload, care about unclosed fences
-    ... --control-span-guard on --control-span-rules code
-
-# the default plus rule 1, by name
-    ... --control-span-guard on --control-span-rules 2,3,4,quote
+    --engine strata --config your-config.json --port 8080 \
+    --control-span-guard on --control-span-rules 2,3,4
 ```
 
-The environment variable does the same thing for anyone who installs the guard into their own server
-instead of using the launcher, and it composes with a launcher that passes no rule flag:
+| value of `--control-span-rules` | what you get |
+|---|---|
+| *(omit the flag)* | `2,3,4` — the recommended default |
+| `all` | all four: the behaviour this guard had before 2026-10-27 |
+| `none` | no span rescue at all — only the thinking-block guard |
+| `code` | one rule by name (its id works too: `4`) |
+| `2,3,4,quote` | spell the set out; `-1` subtracts from the default instead |
 
-```bash
-STRATA_CONTROL_SPAN_RULES=all STRATA_CONTROL_SPAN_GUARD=on .venv/bin/python serve/server.py \
-    --engine strata --config your-config.json --port 8080
-```
-
-**What to pick.** Leave the default. Turn rule 1 back on only if you have evidence of truncations
-that end *inside a quote* and you accept that it also rescues finished answers that quote something —
-which is the artefact described above, not a hypothetical. `none` is for anyone who wants the guard to
-touch nothing but thinking blocks. A typo in the value stops the server at start:
+The same setting exists as the environment variable `STRATA_CONTROL_SPAN_RULES`, which is handy when
+a script builds the command line for you. A wrong value stops the server at start rather than
+quietly running a different check:
 
 ```
 [control-span] unknown control-span rule id '9' (valid: 1-4, all, none)
 ```
 
-**Check what is actually armed** — the first line the guard prints names the rules, so a config file
-or a forgotten environment variable cannot silently change the predicate:
+Whatever is armed is printed on startup, so nothing can be on by accident:
 
-```bash
-grep -a "control-span. ENABLED" your-engine.log
-# [control-span] ENABLED (eos ids [248044, 248046], think ids [248068, 248069],
-#                         window 32, max rescues 5, rules [2:dangling,3:half-tag,4:code])
 ```
+[control-span] ENABLED (eos ids [248044, 248046], think ids [248068, 248069],
+                        window 32, max rescues 5, rules [2:dangling,3:half-tag,4:code])
+```
+
+**What to pick.** The default. Turn rule 1 on only if you are seeing replies cut off *inside a quoted
+phrase*, and you accept that it will also touch finished replies that merely quote something.
 
 ### The mechanism, exactly — 30 seconds, no GPU
 
